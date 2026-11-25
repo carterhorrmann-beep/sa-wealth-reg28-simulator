@@ -1,0 +1,7 @@
+# Streamlit Community Cloud installs this file. "-e .[app]" installs the sa_wealth package
+# (and its dependencies) plus Streamlit from pyproject.toml.
+numpy>=1.24
+pandas>=2.1
+scipy>=1.11
+matplotlib>=3.7
+-e .[app]

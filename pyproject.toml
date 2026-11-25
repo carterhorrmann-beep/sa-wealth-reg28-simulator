@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sa-wealth"
+version = "1.0.0"
+description = "South African Regulation 28 private wealth & tax-aware Monte Carlo allocator"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Carter Horrmann" }]
+keywords = ["south africa", "regulation 28", "monte carlo", "retirement annuity", "tfsa", "portfolio optimisation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Education",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.35"]
+yf = ["yfinance>=0.2.40"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+sa-wealth = "sa_wealth.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
