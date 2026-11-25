@@ -2,6 +2,8 @@
 
 **South African Regulation 28 Private Wealth & Tax-Aware Monte Carlo Allocator**
 
+https://sa-wealth-reg28-simulator-t9gykeq27yzyjmejcrfgwj.streamlit.app/
+
 [![CI](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
