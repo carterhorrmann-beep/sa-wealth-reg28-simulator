@@ -6,10 +6,6 @@
 
 <br>
 
-[![CI](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
 A quantitative wealth-management toolkit for a South African investor, from the first contribution to the last drawdown (**v2.0: Lifecycle Wealth & SARS Tax-Optimisation upgrade**). It answers six questions:
 
 1. **What does Regulation 28 actually cost me?** Constrained (SLSQP) vs unconstrained portfolios, efficient frontiers and a cap-by-cap breakdown.
