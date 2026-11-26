@@ -4,10 +4,6 @@
 
 **[Launch Live Interactive Dashboard](https://streamlit.app)**
 
-![CI](https://github.com)
-![Python](https://shields.io)
-![License](https://shields.io)
-
 [![CI](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
