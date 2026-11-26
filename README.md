@@ -1,8 +1,10 @@
-# sa-wealth-reg28-simulator
+# South African Private Wealth & Lifecycle Monte Carlo Simulator
 
-**South African Regulation 28 Private Wealth, SARS Tax-Optimisation & Living Annuity Drawdown Simulator**
+**Regulation 28 Portfolio Optimisation, SARS 2026/27 Tax-Wrapper Allocation & Living Annuity Drawdown Engine**
 
 **[Launch Live Interactive Dashboard](https://streamlit.app)**
+
+<br>
 
 [![CI](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
