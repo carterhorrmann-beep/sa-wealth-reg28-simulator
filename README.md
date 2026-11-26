@@ -2,7 +2,7 @@
 
 **Regulation 28 Portfolio Optimisation, SARS 2026/27 Tax-Wrapper Allocation & Living Annuity Drawdown Engine**
 
-**[Launch Live Interactive Dashboard](https://streamlit.app)**
+**[Launch Live Interactive Dashboard](https://sa-wealth-reg28-simulator-t9gykeq27yzyjmejcrfgwj.streamlit.app/)**
 
 
 A quantitative wealth-management toolkit for a South African investor, from the first contribution to the last drawdown (**v2.0: Lifecycle Wealth & SARS Tax-Optimisation upgrade**). It answers six questions:
