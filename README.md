@@ -4,7 +4,6 @@
 
 **[Launch Live Interactive Dashboard](https://streamlit.app)**
 
-<br>
 
 A quantitative wealth-management toolkit for a South African investor, from the first contribution to the last drawdown (**v2.0: Lifecycle Wealth & SARS Tax-Optimisation upgrade**). It answers six questions:
 
