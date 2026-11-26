@@ -2,7 +2,11 @@
 
 **South African Regulation 28 Private Wealth, SARS Tax-Optimisation & Living Annuity Drawdown Simulator**
 
-https://sa-wealth-reg28-simulator-t9gykeq27yzyjmejcrfgwj.streamlit.app/
+**[Launch Live Interactive Dashboard](https://streamlit.app)**
+
+![CI](https://github.com)
+![Python](https://shields.io)
+![License](https://shields.io)
 
 [![CI](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/carterhorrmann-beep/sa-wealth-reg28-simulator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
