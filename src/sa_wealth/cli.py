@@ -1,4 +1,4 @@
-"""Command line interface: ``sa-wealth simulate | optimize | tax-compare | stress | charts``."""
+"""Command line interface: ``sa-wealth simulate | optimize | tax-compare | stress | smart-split | drawdown | charts``."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import pandas as pd
 
 from . import __version__
 from .assets import ASSETS, MarketAssumptions, load_assumptions, weights_from_mapping
+from .drawdown import DrawdownConfig, resolve_la_portfolio, run_crash_impact
 from .montecarlo import SimulationConfig, run_stress, run_tax_comparison, simulate
 from .reg28_tax import (
     MARGINAL_RATES,
@@ -24,7 +25,9 @@ from .reg28_tax import (
     efficient_frontier,
     offshore_sensitivity,
     optimize_portfolio,
+    optimize_wrapper_split,
     portfolio_presets,
+    ra_tax_refund,
     reg28_tradeoff,
 )
 
@@ -243,6 +246,102 @@ def cmd_stress(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_smart_split(args: argparse.Namespace) -> int:
+    assumptions = load_assumptions(args.source).with_inflation(args.inflation / 100.0)
+    w = resolve_weights(args.preset, args.weights, assumptions)
+    tax = TAX_PRESETS[args.tax_year]
+    res = optimize_wrapper_split(
+        args.budget,
+        args.income,
+        args.marginal,
+        args.years,
+        age=args.age,
+        weights=w,
+        assumptions=assumptions,
+        tax=tax,
+        n_paths=args.paths,
+        seed=args.seed,
+        reinvest_refund=not args.no_reinvest,
+    )
+    p = res.profile
+    print(f"\n=== SARS {p.tax_year} Smart Contribution Split | {rand(res.monthly_budget)}/month | {res.horizon_years} years | {res.n_paths:,} paths (seed {res.seed}) ===")
+    _print_weights(w, assumptions)
+    print(f"\nTaxable income {rand(p.taxable_income)} (age {args.age:g}): tax before rebates {rand(p.tax_before_rebates)} - rebate {rand(p.rebate)} = {rand(p.tax_payable)} payable")
+    print(f"Marginal rate {p.marginal_rate:.0%} (bracket {p.bracket_number}) | effective rate {p.effective_rate:.1%} | tax-free below {rand(p.tax_threshold)}")
+    full = p.ra_deduction_limit
+    full_refund = ra_tax_refund(full, p.taxable_income, p.age, tax)
+    print(f"RA deduction limit {rand(full)} a year (27.5% of income, max {rand(tax.ra_deduction_cap)}); the full deduction refunds {rand(full_refund)}")
+    sp = res.optimal_split
+    print("\nTax-optimal monthly split (year 1)")
+    for k, name in (("RA", "Retirement Annuity"), ("TFSA", "Tax-Free Savings (TFSA)"), ("DISC", "Taxable Discretionary")):
+        print(f"  {name:<26}{rand(sp[k]):>12}  ({sp[k] / res.monthly_budget:.0%})")
+    print(f"RA refund-arbitrage threshold: {rand(res.arbitrage_annual_ra)} a year (expected RA exit tax {res.arbitrage_exit_rate:.1%}); " + ("RA refunds are reinvested in the TFSA / taxable sleeve." if res.reinvest_refund else "RA refunds are spent (not reinvested)."))
+    cmp = res.comparison(real=True)
+    show = pd.DataFrame(
+        {
+            "RA / month": cmp["RA / month"].map(rand),
+            "TFSA / month": cmp["TFSA / month"].map(rand),
+            "Disc / month": cmp["Discretionary / month"].map(rand),
+            "median after-tax (real)": cmp["median after-tax wealth"].map(rand),
+            "lifetime tax paid (real)": cmp["lifetime tax paid"].map(rand),
+            "SARS refunds (real)": cmp["SARS refunds"].map(rand),
+            "net lifetime tax (real)": cmp["net lifetime tax"].map(rand),
+        }
+    )
+    show.index = [n.split(" (")[0] for n in cmp.index]
+    print("\n" + show.T.to_string())
+    s = res.summary()
+    for label, key in (("Discretionary only", "disc"), ("RA only", "ra")):
+        print(
+            f"\nBlended vs {label}: terminal wealth +{rand(s[f'terminal_wealth_gain_real_vs_{key}'])} (today's rand) | "
+            f"+{rand(s[f'terminal_wealth_gain_nominal_vs_{key}'])} nominal | lifetime tax saved {rand(s[f'lifetime_tax_saved_real_vs_{key}'])} (today's rand) | "
+            f"beats it on {s[f'share_paths_better_vs_{key}']:.0%} of paths"
+        )
+    print("\nLifetime tax = income tax + CGT + RA exit tax, minus SARS refunds; shown in today's rand because rand paid decades apart are not comparable.")
+    return 0
+
+
+def cmd_drawdown(args: argparse.Namespace) -> int:
+    assumptions = load_assumptions(args.source).with_inflation(args.inflation / 100.0)
+    cfg = DrawdownConfig(
+        initial_capital=args.capital,
+        monthly_income_real=args.monthly_income,
+        horizon_years=args.years,
+        retirement_age=args.retire_age,
+        n_paths=args.paths,
+        seed=args.seed,
+        annual_fee=args.fee / 100.0,
+    )
+    if args.weights:
+        portfolio = parse_weights(args.weights)
+    else:
+        portfolio = args.portfolio
+    resolve_la_portfolio(portfolio, assumptions.assets)  # fail early on a bad name
+    impact = run_crash_impact(cfg, assumptions, portfolio)
+    r = impact.base
+    s = r.summary()
+    print(f"\n=== Living Annuity drawdown | {rand(cfg.initial_capital)} at age {cfg.retirement_age} | {cfg.horizon_years} years | {s['n_paths']:,} paths (seed {cfg.seed}) ===")
+    rep = check_reg28(r.weights, assets=assumptions.assets)
+    print("Allocation: " + ", ".join(f"{a} {x:.1%}" for a, x in zip(assumptions.assets, r.weights) if x > 1e-9))
+    note = "" if r.reg28_compliant else " (above the Regulation 28 limits, which do not apply to a Living Annuity)"
+    print(f"Equity {rep.equity:.1%}, offshore {rep.offshore:.1%}, property {rep.property:.1%}{note}")
+    print(f"Desired income {rand(cfg.monthly_income_real)}/month in today's rand, escalating with simulated SA CPI = {cfg.initial_withdrawal_rate:.2%} of starting capital (statutory band {cfg.min_rate:.1%} to {cfg.max_rate:.1%}).")
+    if cfg.initial_withdrawal_rate > cfg.max_rate:
+        print(f"  ! this exceeds the {cfg.max_rate:.1%} ceiling: the most you can draw in year 1 is {rand(cfg.max_initial_monthly_income)}/month.")
+    print(f"\nPortfolio survival to age {cfg.end_age}:          {s['survival_prob']:.1%}")
+    for age in (90, 95):
+        if f"survival_age_{age}" in s and age != cfg.end_age:
+            print(f"Portfolio survival to age {age}:          {s[f'survival_age_{age}']:.1%}")
+    be = "never" if s["median_years_to_cap_breach"] != s["median_years_to_cap_breach"] else f"year {s['median_years_to_cap_breach']:.0f} (age {cfg.retirement_age + s['median_years_to_cap_breach']:.0f})"
+    print(f"Median terminal bequest (today's rand): {rand(s['median_bequest_real'])}  (P10 {rand(s['p10_bequest_real'])})")
+    print(f"Income hits the 17.5% ceiling in {s['cap_breach_prob']:.1%} of paths; median years-to-cap-breach among those: {be}")
+    print(f"Average share of years with income below the desired level: {s['share_years_income_shortfall']:.1%}")
+    print(f"\n=== Sequence-of-returns test: {impact.scenario.name} ===")
+    print(impact.scenario.description)
+    print(impact.formatted_table(rand).to_string())
+    return 0
+
+
 def cmd_charts(args: argparse.Namespace) -> int:
     from .plots import generate_all_charts
 
@@ -286,7 +385,37 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--wrapper", choices=("RA", "TFSA", "DISC"), default="RA")
     x.set_defaults(func=cmd_stress)
 
-    c = sub.add_parser("charts", help="write docs/*.png (fan chart, Reg 28 frontier, tax wrappers, stress tests)")
+    ss = sub.add_parser("smart-split", help="SARS-aware split of a monthly budget across RA, TFSA and Discretionary")
+    ss.add_argument("--budget", type=float, default=15_000, help="monthly budget in today's ZAR (default 15000)")
+    ss.add_argument("--income", type=float, default=650_000, help="gross annual taxable income in ZAR (default 650000)")
+    ss.add_argument("--marginal", type=float, default=None, help="override the marginal rate (default: derived from --income)")
+    ss.add_argument("--age", type=float, default=40, help="age, selects the SARS rebates (default 40)")
+    ss.add_argument("--years", type=int, default=25, help="investment horizon, 5-40 years (default 25)")
+    ss.add_argument("--preset", default="moderate", help="portfolio preset slug (default moderate)")
+    ss.add_argument("--weights", default=None, help='custom weights, e.g. "JSE_EQ=30,SA_BOND=25,GLB_EQ=25,SA_CASH=10,GLB_BOND=10"')
+    ss.add_argument("--tax-year", choices=tuple(TAX_PRESETS), default="2026/27", help="SARS tables and statutory limits (default 2026/27)")
+    ss.add_argument("--no-reinvest", action="store_true", help="spend the RA refund instead of reinvesting it")
+    ss.add_argument("--source", choices=("cma", "yfinance"), default="cma")
+    ss.add_argument("--inflation", type=float, default=5.5, help="mean SA CPI inflation in percent (default 5.5)")
+    ss.add_argument("--paths", type=int, default=2_000, help="Monte Carlo paths (default 2000)")
+    ss.add_argument("--seed", type=int, default=42)
+    ss.set_defaults(func=cmd_smart_split)
+
+    d = sub.add_parser("drawdown", help="Living Annuity drawdown: survival, bequest, 17.5%% ceiling breach, year-1 crash")
+    d.add_argument("--capital", type=float, default=8_000_000, help="initial retirement capital in ZAR (default 8000000)")
+    d.add_argument("--monthly-income", type=float, default=40_000, help="desired monthly income in today's ZAR (default 40000)")
+    d.add_argument("--years", type=int, default=30, help="retirement horizon, 5-40 years (default 30)")
+    d.add_argument("--retire-age", type=int, default=65, help="retirement age (default 65)")
+    d.add_argument("--portfolio", default="moderate", help="conservative | moderate | aggressive-offshore (default moderate)")
+    d.add_argument("--weights", default=None, help="custom weights; Living Annuities are exempt from Regulation 28 caps")
+    d.add_argument("--fee", type=float, default=0.0, help="all-in annual fee in percent (default 0)")
+    d.add_argument("--source", choices=("cma", "yfinance"), default="cma")
+    d.add_argument("--inflation", type=float, default=5.5, help="mean SA CPI inflation in percent (default 5.5)")
+    d.add_argument("--paths", type=int, default=5_000, help="Monte Carlo paths (default 5000)")
+    d.add_argument("--seed", type=int, default=42)
+    d.set_defaults(func=cmd_drawdown)
+
+    c = sub.add_parser("charts", help="write docs/*.png (fan chart, Reg 28 frontier, tax wrappers, stress, living annuity, smart split)")
     _common(c)
     c.set_defaults(paths=5_000, years=30)
     c.add_argument("--out", default="docs", help="output directory (default docs)")

@@ -17,8 +17,9 @@ of this file.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ from .assets import (
     PROPERTY_ASSETS,
     PROPERTY_DISTRIBUTION,
     MarketAssumptions,
+    default_assumptions,
     weights_from_mapping,
 )
 
@@ -601,6 +603,134 @@ LUMP_SUM_TABLE: tuple[tuple[float, float, float], ...] = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# SARS individual income-tax tables (progressive brackets + age rebates)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class IncomeTaxTable:
+    """One SARS tax year of individual income tax: progressive brackets and age-based rebates.
+
+    ``brackets`` is a tuple of ``(upper bound of the bracket, marginal rate)`` in ascending order; the last
+    upper bound is ``math.inf``. Tax before rebates is the sum of ``rate x slice`` over the brackets. The
+    primary rebate applies to everyone, the secondary rebate is added from age 65 and the tertiary rebate is
+    added from age 75. Tax payable is never negative.
+    """
+
+    label: str
+    brackets: tuple[tuple[float, float], ...]
+    primary_rebate: float
+    secondary_rebate: float
+    tertiary_rebate: float
+
+    def __post_init__(self) -> None:
+        uppers = [u for u, _ in self.brackets]
+        rates = [r for _, r in self.brackets]
+        if uppers != sorted(uppers) or len(set(uppers)) != len(uppers) or not math.isinf(uppers[-1]):
+            raise ValueError("bracket upper bounds must be strictly ascending and end with math.inf")
+        if rates != sorted(rates):
+            raise ValueError("bracket rates must be ascending")
+
+    # -- structure -------------------------------------------------------------- #
+    @property
+    def lower_bounds(self) -> tuple[float, ...]:
+        return (0.0,) + tuple(u for u, _ in self.brackets[:-1])
+
+    @property
+    def cumulative_base(self) -> tuple[float, ...]:
+        """Tax before rebates at the lower bound of each bracket (SARS 'R x + y% above R z' constants)."""
+        base, out, lower = 0.0, [], 0.0
+        for upper, rate in self.brackets:
+            out.append(base)
+            if not math.isinf(upper):
+                base += rate * (upper - lower)
+            lower = upper
+        return tuple(out)
+
+    def rebate(self, age: float = 40) -> float:
+        """Total rebate for a taxpayer of ``age`` (age at the end of the tax year)."""
+        total = self.primary_rebate
+        if age >= 65:
+            total += self.secondary_rebate
+        if age >= 75:
+            total += self.tertiary_rebate
+        return float(total)
+
+    def tax_threshold(self, age: float = 40) -> float:
+        """Taxable income below which no tax is payable (rebate / first-bracket rate)."""
+        return self.rebate(age) / self.brackets[0][1]
+
+    # -- calculations ----------------------------------------------------------- #
+    def tax_before_rebates(self, taxable_income):
+        x = np.maximum(np.asarray(taxable_income, dtype=float), 0.0)
+        tax = np.zeros_like(x)
+        lower = 0.0
+        for upper, rate in self.brackets:
+            tax = tax + rate * np.clip(x - lower, 0.0, upper - lower)
+            lower = upper
+        return float(tax) if tax.ndim == 0 else tax
+
+    def tax(self, taxable_income, age: float = 40):
+        """Normal income tax payable after rebates (scalar in, scalar out; arrays work too)."""
+        out = np.maximum(np.asarray(self.tax_before_rebates(taxable_income)) - self.rebate(age), 0.0)
+        return float(out) if out.ndim == 0 else out
+
+    def bracket_index(self, taxable_income: float) -> int:
+        """Zero-based index of the bracket that taxes the *next* rand (R245,100 itself is still in bracket 0)."""
+        x = float(taxable_income)
+        for i, (upper, _) in enumerate(self.brackets):
+            if x <= upper:
+                return i
+        return len(self.brackets) - 1
+
+    def marginal_rate(self, taxable_income: float) -> float:
+        """Statutory marginal rate of the bracket containing ``taxable_income`` (0 for non-positive income).
+
+        Below the tax threshold the rebate absorbs all tax, so no tax is actually payable even though the
+        statutory rate is 18%; :meth:`tax` and :func:`ra_tax_refund` handle that exactly.
+        """
+        if taxable_income <= 0:
+            return 0.0
+        return float(self.brackets[self.bracket_index(taxable_income)][1])
+
+
+_INF = math.inf
+#: 2025/26 (1 Mar 2025 - 28 Feb 2026): the table most people still carry in their heads.
+SARS_2025_26 = IncomeTaxTable(
+    label="2025/26",
+    brackets=(
+        (237_100.0, 0.18),
+        (370_500.0, 0.26),
+        (512_800.0, 0.31),
+        (673_000.0, 0.36),
+        (857_900.0, 0.39),
+        (1_817_000.0, 0.41),
+        (_INF, 0.45),
+    ),
+    primary_rebate=17_235.0,
+    secondary_rebate=9_444.0,
+    tertiary_rebate=3_145.0,
+)
+#: 2026/27 (1 Mar 2026 - 28 Feb 2027): Budget 2026 lifted brackets and rebates by 3.4% for inflation.
+SARS_2026_27 = IncomeTaxTable(
+    label="2026/27",
+    brackets=(
+        (245_100.0, 0.18),
+        (383_100.0, 0.26),
+        (530_200.0, 0.31),
+        (695_800.0, 0.36),
+        (887_000.0, 0.39),
+        (1_878_600.0, 0.41),
+        (_INF, 0.45),
+    ),
+    primary_rebate=17_820.0,
+    secondary_rebate=9_765.0,
+    tertiary_rebate=3_249.0,
+)
+INCOME_TAX_TABLES = {"2025/26": SARS_2025_26, "2026/27": SARS_2026_27}
+
+
 @dataclass(frozen=True)
 class TaxParameters:
     """Statutory parameters of the SA tax wrappers. All limits are nominal and held fixed."""
@@ -618,6 +748,7 @@ class TaxParameters:
     ra_lump_sum_fraction: float = 1.0 / 3.0
     lump_sum_table: tuple = LUMP_SUM_TABLE
     representative_incomes: tuple = _INCOME_2025_26
+    income_tax_table: IncomeTaxTable = SARS_2025_26
 
     def effective_cgt_rate(self, marginal_rate: float) -> float:
         """Effective CGT rate = inclusion rate x marginal rate (40% x 45% = 18%)."""
@@ -638,6 +769,7 @@ TAX_2026_27 = TaxParameters(
     ra_deduction_cap=430_000.0,
     cgt_annual_exclusion=50_000.0,
     representative_incomes=_INCOME_2026_27,
+    income_tax_table=SARS_2026_27,
 )
 TAX_PRESETS = {"2025/26": TAX_2025_26, "2026/27": TAX_2026_27}
 DEFAULT_TAX = TAX_2025_26
@@ -1038,3 +1170,524 @@ def compare_wrappers(
         DISC: simulate_wrapper(weights=w, wrapper=DISC, **common),
         GROSS: simulate_wrapper(weights=w, wrapper=GROSS, **common),
     }
+
+
+# =========================================================================== #
+# Part 3 - SARS income-tax profile and the Smart Contribution Allocator
+# =========================================================================== #
+
+
+def income_tax(taxable_income, age: float = 40, table: IncomeTaxTable = SARS_2026_27):
+    """Normal income tax payable (after age rebates) on ``taxable_income``."""
+    return table.tax(taxable_income, age)
+
+
+def marginal_tax_rate(taxable_income: float, table: IncomeTaxTable = SARS_2026_27) -> float:
+    """Statutory marginal rate on the next rand of ``taxable_income``."""
+    return table.marginal_rate(taxable_income)
+
+
+def ra_deduction_limit(taxable_income: float, tax: TaxParameters | None = None) -> float:
+    """Annual RA deduction ceiling: 27.5% of taxable income, at most the statutory cap (R430,000 for 2026/27)."""
+    tax = TAX_2026_27 if tax is None else tax
+    return float(min(tax.ra_deduction_pct * max(float(taxable_income), 0.0), tax.ra_deduction_cap))
+
+
+def ra_tax_refund(
+    contribution,
+    taxable_income: float,
+    age: float = 40,
+    tax: TaxParameters | None = None,
+    table: IncomeTaxTable | None = None,
+):
+    """Exact SARS refund for an RA contribution: tax before the deduction minus tax after it.
+
+    The deductible amount is ``min(contribution, ra_deduction_limit)``. Because the whole tax function is
+    evaluated before and after, the refund correctly handles a deduction that spans several brackets and a
+    taxpayer whose tax is already absorbed by the rebates. ``contribution`` may be an array.
+    """
+    tax = TAX_2026_27 if tax is None else tax
+    table = tax.income_tax_table if table is None else table
+    inc = max(float(taxable_income), 0.0)
+    deductible = np.minimum(np.maximum(np.asarray(contribution, dtype=float), 0.0), ra_deduction_limit(inc, tax))
+    out = table.tax(inc, age) - table.tax(np.maximum(inc - deductible, 0.0), age)
+    return float(out) if np.ndim(out) == 0 else out
+
+
+@dataclass(frozen=True)
+class IncomeTaxProfile:
+    """What SARS does with one annual taxable income: rates, tax payable and the RA refund on offer."""
+
+    tax_year: str
+    taxable_income: float
+    age: float
+    tax_before_rebates: float
+    rebate: float
+    tax_payable: float
+    marginal_rate: float
+    effective_rate: float
+    bracket_number: int  # 1-based
+    bracket_floor: float
+    bracket_ceiling: float
+    tax_threshold: float
+    ra_deduction_limit: float
+    ra_contribution: float
+    ra_deductible: float
+    ra_refund: float
+    ra_refund_rate: float  # refund / deductible: the average rate at which the deduction is refunded
+    tax_after_ra: float
+
+    @property
+    def monthly_tax_payable(self) -> float:
+        return self.tax_payable / 12.0
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+
+def income_tax_profile(
+    taxable_income: float,
+    age: float = 40,
+    ra_contribution: float | None = None,
+    tax: TaxParameters | None = None,
+    table: IncomeTaxTable | None = None,
+) -> IncomeTaxProfile:
+    """Marginal rate, effective rate, tax payable and exact RA refund for an annual taxable income (ZAR).
+
+    ``ra_contribution`` is the annual RA contribution to test; by default the full statutory deduction
+    (27.5% of income up to the cap) so ``ra_refund`` is the largest refund available.
+    """
+    tax = TAX_2026_27 if tax is None else tax
+    table = tax.income_tax_table if table is None else table
+    inc = max(float(taxable_income), 0.0)
+    limit = ra_deduction_limit(inc, tax)
+    contrib = limit if ra_contribution is None else max(float(ra_contribution), 0.0)
+    deductible = min(contrib, limit)
+    before = float(table.tax_before_rebates(inc))
+    payable = float(table.tax(inc, age))
+    refund = float(ra_tax_refund(contrib, inc, age, tax, table))
+    idx = table.bracket_index(inc)
+    return IncomeTaxProfile(
+        tax_year=table.label,
+        taxable_income=inc,
+        age=float(age),
+        tax_before_rebates=before,
+        rebate=table.rebate(age),
+        tax_payable=payable,
+        marginal_rate=table.marginal_rate(inc),
+        effective_rate=payable / inc if inc > 0 else 0.0,
+        bracket_number=idx + 1,
+        bracket_floor=table.lower_bounds[idx],
+        bracket_ceiling=table.brackets[idx][0],
+        tax_threshold=table.tax_threshold(age),
+        ra_deduction_limit=limit,
+        ra_contribution=contrib,
+        ra_deductible=deductible,
+        ra_refund=refund,
+        ra_refund_rate=refund / deductible if deductible > 0 else 0.0,
+        tax_after_ra=float(table.tax(max(inc - deductible, 0.0), age)),
+    )
+
+
+def ra_arbitrage_threshold(
+    taxable_income: float,
+    exit_tax_rate: float,
+    tax: TaxParameters | None = None,
+    table: IncomeTaxTable | None = None,
+) -> float:
+    """Largest annual RA deduction whose *marginal* refund still beats the tax paid on exit.
+
+    Each rand deducted is refunded at the rate of the bracket it is taken from, working down from the top of
+    the taxpayer's income. A rand is worth deducting while that bracket rate is at least ``exit_tax_rate``,
+    the rate at which the same rand will be taxed when the RA pays out. The result is also capped by the
+    statutory deduction limit. Above it the refund-rate arbitrage is gone and any further RA benefit comes
+    only from tax-free growth.
+    """
+    tax = TAX_2026_27 if tax is None else tax
+    table = tax.income_tax_table if table is None else table
+    inc = max(float(taxable_income), 0.0)
+    floor = next(
+        (lo for lo, (_, rate) in zip(table.lower_bounds, table.brackets) if rate >= exit_tax_rate - 1e-12), math.inf
+    )
+    return float(min(max(inc - floor, 0.0), ra_deduction_limit(inc, tax)))
+
+
+# --------------------------------------------------------------------------- #
+# Smart Contribution Allocator
+# --------------------------------------------------------------------------- #
+
+STRATEGY_DISC = "discretionary"
+STRATEGY_RA = "ra_only"
+STRATEGY_BLENDED = "blended"
+STRATEGY_NAMES = {
+    STRATEGY_DISC: "Naive Discretionary Only (100% taxable)",
+    STRATEGY_RA: "Naive RA Only (statutory cap, overflow to Discretionary)",
+    STRATEGY_BLENDED: "Tax-Optimal Blended (RA + TFSA + Discretionary)",
+}
+
+
+@dataclass
+class StrategyOutcome:
+    """Path-wise result of one contribution strategy (nominal ZAR unless stated)."""
+
+    key: str
+    name: str
+    monthly_split: dict  # year-1 monthly ZAR: {"RA": x, "TFSA": y, "DISC": z}
+    terminal_net: np.ndarray  # (P,) after-tax wealth at the horizon, incl. reinvested refunds
+    terminal_real: np.ndarray
+    tax_paid: np.ndarray  # income tax + CGT + RA exit tax
+    tax_paid_real: np.ndarray
+    refunds: np.ndarray  # SARS RA refunds received
+    refunds_real: np.ndarray
+    refunds_reinvested: bool
+
+    @property
+    def net_tax_cost(self) -> np.ndarray:
+        """Lifetime tax paid minus RA refunds received (nominal)."""
+        return self.tax_paid - self.refunds
+
+    @property
+    def net_tax_cost_real(self) -> np.ndarray:
+        return self.tax_paid_real - self.refunds_real
+
+
+@dataclass
+class SmartSplitResult:
+    """Outcome of :func:`optimize_wrapper_split`."""
+
+    monthly_budget: float
+    gross_income: float
+    marginal_rate: float
+    age: float
+    horizon_years: int
+    tax: TaxParameters
+    reinvest_refund: bool
+    profile: IncomeTaxProfile
+    strategies: dict
+    optimal_ra_monthly: float
+    arbitrage_exit_rate: float
+    arbitrage_annual_ra: float
+    weights: np.ndarray
+    weights_ra: np.ndarray
+    n_paths: int
+    seed: int | None
+    cpi_final: np.ndarray
+    grid: pd.DataFrame
+
+    @property
+    def blended(self) -> StrategyOutcome:
+        return self.strategies[STRATEGY_BLENDED]
+
+    @property
+    def optimal_split(self) -> dict:
+        """Year-1 monthly ZAR split of the tax-optimal strategy: ``{"RA", "TFSA", "DISC"}``."""
+        return dict(self.blended.monthly_split)
+
+    @property
+    def best_single(self) -> str:
+        """The better single-wrapper baseline (by mean real after-tax wealth)."""
+        a, b = self.strategies[STRATEGY_DISC], self.strategies[STRATEGY_RA]
+        return STRATEGY_DISC if a.terminal_real.mean() >= b.terminal_real.mean() else STRATEGY_RA
+
+    def gain_vs(self, baseline: str) -> dict:
+        """Blended minus ``baseline`` (paired by path): terminal-wealth gain and lifetime tax saved, in ZAR."""
+        b, o = self.blended, self.strategies[baseline]
+        return {
+            "terminal_wealth_gain_real": float((b.terminal_real - o.terminal_real).mean()),
+            "terminal_wealth_gain_nominal": float((b.terminal_net - o.terminal_net).mean()),
+            "terminal_wealth_gain_real_median": float(np.median(b.terminal_real) - np.median(o.terminal_real)),
+            "lifetime_tax_saved_real": float((o.net_tax_cost_real - b.net_tax_cost_real).mean()),
+            "lifetime_tax_saved_nominal": float((o.net_tax_cost - b.net_tax_cost).mean()),
+            "share_paths_better": float(np.mean(b.terminal_net > o.terminal_net)),
+        }
+
+    def summary(self) -> dict:
+        out: dict = {
+            "tax_year": self.tax.income_tax_table.label,
+            "gross_income": self.gross_income,
+            "marginal_rate": self.marginal_rate,
+            "effective_rate": self.profile.effective_rate,
+            "monthly_budget": self.monthly_budget,
+            "horizon_years": self.horizon_years,
+            "n_paths": self.n_paths,
+            "optimal_ra_monthly": self.optimal_split["RA"],
+            "optimal_tfsa_monthly": self.optimal_split["TFSA"],
+            "optimal_disc_monthly": self.optimal_split["DISC"],
+            "best_single": self.best_single,
+        }
+        for label, key in (("disc", STRATEGY_DISC), ("ra", STRATEGY_RA), ("best_single", self.best_single)):
+            for k, v in self.gain_vs(key).items():
+                out[f"{k}_vs_{label}"] = v
+        return out
+
+    def comparison(self, real: bool = True) -> pd.DataFrame:
+        """One row per strategy: split, median / mean after-tax wealth, lifetime tax and refunds."""
+        rows = []
+        for key, st in self.strategies.items():
+            term = st.terminal_real if real else st.terminal_net
+            tax_cost = st.net_tax_cost_real if real else st.net_tax_cost
+            refunds = st.refunds_real if real else st.refunds
+            rows.append(
+                {
+                    "strategy": st.name,
+                    "RA / month": st.monthly_split["RA"],
+                    "TFSA / month": st.monthly_split["TFSA"],
+                    "Discretionary / month": st.monthly_split["DISC"],
+                    "median after-tax wealth": float(np.median(term)),
+                    "mean after-tax wealth": float(term.mean()),
+                    "lifetime tax paid": float((st.tax_paid_real if real else st.tax_paid).mean()),
+                    "SARS refunds": float(refunds.mean()),
+                    "net lifetime tax": float(tax_cost.mean()),
+                }
+            )
+        return pd.DataFrame(rows).set_index("strategy")
+
+
+def _simulate_strategy(
+    *,
+    returns: np.ndarray,
+    cpi: np.ndarray,
+    monthly_budget: float,
+    ra_monthly_y1: float,
+    use_tfsa: bool,
+    reinvest_refund: bool,
+    gross_income: float,
+    age: float,
+    tax: TaxParameters,
+    marginal_rate: float,
+    retirement_tax_rate: float,
+    weights: np.ndarray,
+    weights_ra: np.ndarray,
+    income_yield: np.ndarray,
+    income_class: Sequence[str],
+    assets: Sequence[str],
+    limits: Reg28Limits,
+    key: str = "",
+    name: str = "",
+) -> tuple[StrategyOutcome, float]:
+    """Run one split on the given market paths. Returns the outcome and the mean RA exit-tax rate.
+
+    Budget and income escalate with the realised CPI (as in the main engine); statutory rand limits stay
+    nominal. RA contributions are ``min(ra_monthly_y1 x CPI, statutory limit / 12)`` and the rest of the budget
+    goes to the TFSA (overflow: taxable account) or, for the naive strategies, straight to a taxable account.
+    The SARS refund is computed exactly from the tax table in today's rand and, if ``reinvest_refund``, lands
+    in the second sleeve at the start of the next tax year (the final refund is added as cash).
+    """
+    p, t, _ = returns.shape
+    years = t // 12
+    year_of_month = np.arange(t) // 12
+    cpi_year = cpi[:, 12 * np.arange(years)]  # (P, Y) CPI at the start of each tax year
+    cpi_m = cpi_year[:, year_of_month]  # (P, T)
+    budget_m = monthly_budget * cpi_m
+    limit_y = np.minimum(tax.ra_deduction_pct * gross_income * cpi_year, tax.ra_deduction_cap)  # (P, Y)
+    ra_m = np.minimum(np.minimum(ra_monthly_y1 * cpi_m, (limit_y / 12.0)[:, year_of_month]), budget_m)
+    rest = budget_m - ra_m
+
+    # exact SARS refund per tax year: tax(income) - tax(income - deduction) in today's rand, re-inflated
+    table = tax.income_tax_table
+    deduction_real = ra_m.reshape(p, years, 12).sum(axis=2) / cpi_year
+    refund_real_at_start = table.tax(gross_income, age) - table.tax(np.maximum(gross_income - deduction_real, 0.0), age)
+    refund_y = np.asarray(refund_real_at_start) * cpi_year  # (P, Y) nominal, received at the end of each tax year
+
+    c2 = rest.copy()
+    cash_last = np.zeros(p)
+    if reinvest_refund:
+        c2[:, 12::12] += refund_y[:, :-1]
+        cash_last = refund_y[:, -1]
+
+    common = dict(
+        income_yield=income_yield,
+        income_class=income_class,
+        tax=tax,
+        marginal_rate=marginal_rate,
+        annual_income=gross_income,
+        retirement_tax_rate=retirement_tax_rate,
+        assets=assets,
+        limits=limits,
+    )
+    net = cash_last.copy()
+    tax_paid = np.zeros(p)
+    tax_paid_real = np.zeros(p)
+    exit_rate = 0.0
+    if np.any(ra_m > 0):
+        ra_out = simulate_wrapper(returns, cpi, weights_ra, ra_m, RA, reinvest_refund=False, **common)
+        net += ra_out.terminal_net
+        tax_paid += ra_out.tax_paid
+        tax_paid_real += ra_out.tax_paid_real
+        exit_rate = float(np.mean(ra_out.tax_exit / np.maximum(ra_out.terminal_pre_exit, 1e-9)))
+    if np.any(c2 > 0):
+        o2 = simulate_wrapper(returns, cpi, weights, c2, TFSA if use_tfsa else DISC, reinvest_refund=False, **common)
+        net += o2.terminal_net
+        tax_paid += o2.tax_paid
+        tax_paid_real += o2.tax_paid_real
+
+    ra1 = float(ra_m[0, 0])
+    rest1 = monthly_budget - ra1
+    tfsa1 = min(rest1, tax.tfsa_annual_limit / 12.0) if use_tfsa else 0.0
+    split = {"RA": ra1, "TFSA": tfsa1, "DISC": rest1 - tfsa1}
+    cpi_receipt = cpi[:, 12::12]  # CPI when each year's refund is received
+    out = StrategyOutcome(
+        key=key,
+        name=name,
+        monthly_split=split,
+        terminal_net=net,
+        terminal_real=net / cpi[:, -1],
+        tax_paid=tax_paid,
+        tax_paid_real=tax_paid_real,
+        refunds=refund_y.sum(axis=1),
+        refunds_real=(refund_y / cpi_receipt).sum(axis=1),
+        refunds_reinvested=reinvest_refund,
+    )
+    return out, exit_rate
+
+
+def optimize_wrapper_split(
+    monthly_budget: float,
+    gross_income: float | None = None,
+    marginal_rate: float | None = None,
+    horizon_years: int = 25,
+    *,
+    age: float = 40,
+    weights: Mapping[str, float] | Sequence[float] | None = None,
+    assumptions: MarketAssumptions | None = None,
+    tax: TaxParameters | None = None,
+    n_paths: int = 2_000,
+    seed: int | None = 42,
+    reinvest_refund: bool = True,
+    retirement_tax_rate: float | None = None,
+    n_grid: int = 21,
+    restrict_to_arbitrage: bool = False,
+    limits: Reg28Limits = REG28,
+) -> SmartSplitResult:
+    """Smart Contribution Allocator: how to split a monthly budget across RA, TFSA and Discretionary.
+
+    Three strategies run on identical Monte Carlo paths (common random numbers):
+
+    1. **Naive Discretionary Only**: everything taxable.
+    2. **Naive RA Only**: RA up to the statutory deduction limit (27.5% of income, max R430,000 for 2026/27),
+       overflow to Discretionary.
+    3. **Tax-Optimal Blended**: RA, then the TFSA (R46,000 a year, R500,000 lifetime), then Discretionary
+       overflow. The RA share is found by grid search over ``[0, min(budget, statutory limit)]`` on the
+       deterministic expected-return path, then evaluated on the Monte Carlo paths. With ``reinvest_refund`` the
+       annual SARS refund is reinvested straight into the TFSA / Discretionary sleeve.
+
+    ``gross_income`` is annual taxable income in ZAR and drives the exact SARS refund (``None``: a
+    representative income for ``marginal_rate``). ``marginal_rate`` taxes interest and foreign income in the
+    taxable sleeves (``None``: the statutory rate for ``gross_income``). The refund arbitrage threshold (where
+    the marginal refund rate drops below the exit tax rate) is reported, and ``restrict_to_arbitrage`` forbids
+    any RA contribution above it.
+
+    The budget and income escalate with the simulated CPI; statutory rand limits are nominal and fixed.
+    """
+    from .montecarlo import expected_return_paths, generate_paths  # local import: montecarlo imports this module
+
+    tax = TAX_2026_27 if tax is None else tax
+    if monthly_budget <= 0:
+        raise ValueError("monthly_budget must be positive")
+    if not 5 <= int(horizon_years) <= 40:
+        raise ValueError("horizon_years must be between 5 and 40")
+    if n_paths < 100:
+        raise ValueError("n_paths must be at least 100")
+    if gross_income is None and marginal_rate is None:
+        raise ValueError("provide gross_income and/or marginal_rate")
+    if gross_income is None:
+        gross_income = tax.income_for_bracket(float(marginal_rate))
+    if gross_income <= 0:
+        raise ValueError("gross_income must be positive")
+    table = tax.income_tax_table
+    if marginal_rate is None:
+        marginal_rate = table.marginal_rate(gross_income)
+    if not 0.0 <= marginal_rate < 0.6:
+        raise ValueError("marginal_rate must be a fraction such as 0.36")
+    horizon_years = int(horizon_years)
+
+    assumptions = default_assumptions() if assumptions is None else assumptions
+    assets = assumptions.assets
+    if weights is None:
+        w = weights_from_mapping(STATIC_PRESETS["Moderate (Reg 28)"], assets)
+    elif isinstance(weights, Mapping):
+        w = weights_from_mapping(weights, assets)
+    else:
+        w = np.asarray(weights, dtype=float)
+    w = w / w.sum()
+    w_ra = w if is_reg28_compliant(w, limits, assets=assets) else project_to_reg28(w, limits, assets)
+    rrate = min(marginal_rate, 0.31) if retirement_tax_rate is None else float(retirement_tax_rate)
+    income_class = tuple(INCOME_CLASS[a] for a in assets)
+
+    base = dict(
+        monthly_budget=float(monthly_budget),
+        gross_income=float(gross_income),
+        age=age,
+        tax=tax,
+        marginal_rate=float(marginal_rate),
+        retirement_tax_rate=rrate,
+        weights=w,
+        weights_ra=w_ra,
+        income_yield=assumptions.income_yield,
+        income_class=income_class,
+        assets=assets,
+        limits=limits,
+    )
+
+    # ---- 1. search the RA share on the deterministic expected-return path -------------------------- #
+    det = expected_return_paths(assumptions, horizon_years)
+    ra_limit_month = ra_deduction_limit(gross_income, tax) / 12.0
+    a_max = min(float(monthly_budget), ra_limit_month)
+    _, exit_rate = _simulate_strategy(
+        returns=det.returns, cpi=det.cpi, ra_monthly_y1=a_max, use_tfsa=True, reinvest_refund=reinvest_refund, **base
+    )
+    arbitrage = ra_arbitrage_threshold(gross_income, exit_rate, tax, table)
+    if restrict_to_arbitrage:
+        a_max = min(a_max, arbitrage / 12.0)
+    grid_a = np.linspace(0.0, a_max, max(int(n_grid), 2)) if a_max > 0 else np.array([0.0])
+    values = []
+    for a in grid_a:
+        o, _ = _simulate_strategy(
+            returns=det.returns, cpi=det.cpi, ra_monthly_y1=float(a), use_tfsa=True, reinvest_refund=reinvest_refund, **base
+        )
+        values.append(float(o.terminal_real[0]))
+    best = int(np.argmax(values))
+    a_star = float(grid_a[best])
+    grid = pd.DataFrame({"ra_monthly": grid_a, "terminal_real_expected_path": values}).set_index("ra_monthly")
+
+    # ---- 2. evaluate the three strategies on the Monte Carlo paths --------------------------------- #
+    mc = generate_paths(assumptions, int(n_paths), horizon_years, seed)
+    specs = (
+        (STRATEGY_DISC, 0.0, False),
+        (STRATEGY_RA, min(float(monthly_budget), ra_limit_month), False),
+        (STRATEGY_BLENDED, a_star, True),
+    )
+    strategies = {}
+    for key, a, use_tfsa in specs:
+        o, _ = _simulate_strategy(
+            returns=mc.returns,
+            cpi=mc.cpi,
+            ra_monthly_y1=a,
+            use_tfsa=use_tfsa,
+            reinvest_refund=reinvest_refund,
+            key=key,
+            name=STRATEGY_NAMES[key],
+            **base,
+        )
+        strategies[key] = o
+
+    return SmartSplitResult(
+        monthly_budget=float(monthly_budget),
+        gross_income=float(gross_income),
+        marginal_rate=float(marginal_rate),
+        age=float(age),
+        horizon_years=horizon_years,
+        tax=tax,
+        reinvest_refund=reinvest_refund,
+        profile=income_tax_profile(gross_income, age, a_star * 12.0, tax, table),
+        strategies=strategies,
+        optimal_ra_monthly=a_star,
+        arbitrage_exit_rate=exit_rate,
+        arbitrage_annual_ra=arbitrage,
+        weights=w,
+        weights_ra=w_ra,
+        n_paths=int(n_paths),
+        seed=seed,
+        cpi_final=mc.cpi[:, -1],
+        grid=grid,
+    )

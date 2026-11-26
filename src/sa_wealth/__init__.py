@@ -1,4 +1,4 @@
-"""sa-wealth: South African Regulation 28 private wealth & tax-aware Monte Carlo allocator."""
+"""sa-wealth: South African Regulation 28 private wealth, SARS tax-aware allocator & Living Annuity drawdown simulator."""
 
 from .assets import (
     ASSETS,
@@ -8,6 +8,18 @@ from .assets import (
     default_assumptions,
     load_assumptions,
     sanitise_zac_series,
+)
+from .drawdown import (
+    LA_MAX_RATE,
+    LA_MIN_RATE,
+    LA_PORTFOLIOS,
+    RETIREMENT_CRASH,
+    CrashImpact,
+    DrawdownConfig,
+    DrawdownResult,
+    clamp_drawdown_rate,
+    run_crash_impact,
+    run_drawdown,
 )
 from .montecarlo import (
     DEFAULT_SCENARIOS,
@@ -21,39 +33,69 @@ from .montecarlo import (
 )
 from .reg28_tax import (
     REG28,
+    SARS_2025_26,
+    SARS_2026_27,
     TAX_2025_26,
     TAX_2026_27,
+    IncomeTaxProfile,
+    IncomeTaxTable,
     Reg28Limits,
+    SmartSplitResult,
     TaxParameters,
     apply_tfsa_limits,
     check_reg28,
+    income_tax,
+    income_tax_profile,
+    marginal_tax_rate,
     optimize_portfolio,
+    optimize_wrapper_split,
     project_to_reg28,
+    ra_tax_refund,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "ASSETS",
     "ASSET_NAMES",
     "CMA_TABLE",
+    "CrashImpact",
     "DEFAULT_SCENARIOS",
+    "DrawdownConfig",
+    "DrawdownResult",
+    "IncomeTaxProfile",
+    "IncomeTaxTable",
+    "LA_MAX_RATE",
+    "LA_MIN_RATE",
+    "LA_PORTFOLIOS",
     "MarketAssumptions",
     "REG28",
+    "RETIREMENT_CRASH",
     "Reg28Limits",
+    "SARS_2025_26",
+    "SARS_2026_27",
     "SimulationConfig",
     "SimulationResult",
+    "SmartSplitResult",
     "StressScenario",
     "TAX_2025_26",
     "TAX_2026_27",
     "TaxParameters",
     "apply_tfsa_limits",
     "check_reg28",
+    "clamp_drawdown_rate",
     "default_assumptions",
     "generate_paths",
+    "income_tax",
+    "income_tax_profile",
     "load_assumptions",
+    "marginal_tax_rate",
     "optimize_portfolio",
+    "optimize_wrapper_split",
     "project_to_reg28",
+    "ra_tax_refund",
+    "run_crash_impact",
+    "run_drawdown",
     "run_stress",
     "run_tax_comparison",
     "sanitise_zac_series",

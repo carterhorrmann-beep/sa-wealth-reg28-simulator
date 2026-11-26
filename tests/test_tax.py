@@ -1,4 +1,6 @@
-"""SA tax wrappers: RA, TFSA and taxable Discretionary."""
+"""SA tax wrappers (RA, TFSA, Discretionary), SARS income-tax tables and the Smart Contribution Allocator."""
+
+import math
 
 import numpy as np
 import pytest
@@ -8,16 +10,27 @@ from sa_wealth.montecarlo import build_contributions, expected_return_paths
 from sa_wealth.reg28_tax import (
     DISC,
     GROSS,
+    INCOME_TAX_TABLES,
     RA,
+    SARS_2025_26,
+    SARS_2026_27,
     TAX_2025_26,
     TAX_2026_27,
     TFSA,
+    IncomeTaxTable,
     Reg28Violation,
     apply_tfsa_limits,
     compare_wrappers,
+    income_tax,
+    income_tax_profile,
     is_reg28_compliant,
     lump_sum_tax,
+    marginal_tax_rate,
+    optimize_wrapper_split,
+    ra_arbitrage_threshold,
+    ra_deduction_limit,
     ra_exit_tax,
+    ra_tax_refund,
     simulate_wrapper,
 )
 
@@ -317,3 +330,246 @@ def test_input_validation():
     r7, cpi7 = flat(7)
     with pytest.raises(ValueError):
         run(DISC, wvec(SA_CASH=1.0), r7, cpi7, lump(7, 1000))  # not whole years
+
+
+# --------------------------------------------------------------------------- #
+# SARS individual income tax tables (hand-worked examples)
+# --------------------------------------------------------------------------- #
+def test_sars_2026_27_table_constants():
+    assert [b for b, _ in SARS_2026_27.brackets[:-1]] == [245_100, 383_100, 530_200, 695_800, 887_000, 1_878_600]
+    assert [r for _, r in SARS_2026_27.brackets] == [0.18, 0.26, 0.31, 0.36, 0.39, 0.41, 0.45]
+    assert (SARS_2026_27.primary_rebate, SARS_2026_27.secondary_rebate, SARS_2026_27.tertiary_rebate) == (17_820, 9_765, 3_249)
+    # the 'R x + y% above R z' constants published by SARS
+    assert [round(x) for x in SARS_2026_27.cumulative_base] == [0, 44_118, 79_998, 125_599, 185_215, 259_783, 666_339]
+    assert INCOME_TAX_TABLES["2026/27"] is SARS_2026_27 and INCOME_TAX_TABLES["2025/26"] is SARS_2025_26
+
+
+def test_sars_2025_26_table_is_the_previous_year():
+    assert SARS_2025_26.brackets[0] == (237_100, 0.18) and SARS_2025_26.brackets[-2][0] == 1_817_000
+    assert (SARS_2025_26.primary_rebate, SARS_2025_26.secondary_rebate, SARS_2025_26.tertiary_rebate) == (17_235, 9_444, 3_145)
+    assert [round(x) for x in SARS_2025_26.cumulative_base] == [0, 42_678, 77_362, 121_475, 179_147, 251_258, 644_489]
+
+
+def test_tax_presets_carry_their_own_income_tax_table():
+    assert TAX_2026_27.income_tax_table is SARS_2026_27
+    assert TAX_2025_26.income_tax_table is SARS_2025_26
+
+
+def test_income_tax_hand_worked_examples_2026_27():
+    # R500,000: 79,998 + 31% x (500,000 - 383,100) = 116,237.00 before rebates
+    assert SARS_2026_27.tax_before_rebates(500_000) == pytest.approx(116_237.0)
+    assert income_tax(500_000, age=40) == pytest.approx(116_237.0 - 17_820.0)  # 98,417
+    assert income_tax(500_000, age=66) == pytest.approx(116_237.0 - 17_820.0 - 9_765.0)  # 88,652
+    assert income_tax(500_000, age=76) == pytest.approx(116_237.0 - 17_820.0 - 9_765.0 - 3_249.0)  # 85,403
+    # R1,000,000: 259,783 + 41% x 113,000 = 306,113
+    assert income_tax(1_000_000) == pytest.approx(306_113.0 - 17_820.0)
+    # R2,000,000: 666,339 + 45% x 121,400 = 720,969
+    assert income_tax(2_000_000) == pytest.approx(720_969.0 - 17_820.0)
+
+
+def test_income_tax_hand_worked_example_2025_26_for_comparison():
+    # R500,000: 77,362 + 31% x (500,000 - 370,500) = 117,507; less primary rebate 17,235
+    assert income_tax(500_000, 40, SARS_2025_26) == pytest.approx(117_507.0 - 17_235.0)
+
+
+@pytest.mark.parametrize("age,threshold", [(40, 99_000), (66, 153_250), (76, 171_300)])
+def test_tax_thresholds_by_age(age, threshold):
+    assert SARS_2026_27.tax_threshold(age) == pytest.approx(threshold)
+    assert income_tax(threshold, age) == pytest.approx(0.0, abs=1e-6)
+    assert income_tax(threshold + 10_000, age) == pytest.approx(1_800.0)
+    assert income_tax(threshold - 1, age) == 0.0
+
+
+def test_income_tax_never_negative_and_monotone_and_vectorised():
+    inc = np.array([-5_000.0, 0.0, 50_000.0, 99_000.0, 300_000.0, 900_000.0, 3_000_000.0])
+    tax = income_tax(inc)
+    assert np.all(tax >= 0) and np.all(np.diff(tax) >= 0)
+    assert tax[0] == tax[1] == 0.0
+    assert tax[4] == pytest.approx(income_tax(300_000.0))
+
+
+@pytest.mark.parametrize(
+    "income,rate",
+    [(0, 0.0), (100_000, 0.18), (245_100, 0.18), (245_101, 0.26), (383_100, 0.26), (500_000, 0.31), (650_000, 0.36),
+     (800_000, 0.39), (1_000_000, 0.41), (1_878_600, 0.41), (1_878_601, 0.45), (10_000_000, 0.45)],
+)
+def test_marginal_rate_by_bracket(income, rate):
+    assert marginal_tax_rate(income) == rate
+
+
+def test_effective_rate_and_profile_fields():
+    p = income_tax_profile(650_000, age=40)
+    assert p.tax_year == "2026/27"
+    # 125,599 + 36% x 119,800 - 17,820 = 150,907
+    assert p.tax_payable == pytest.approx(150_907.0, abs=0.5)
+    assert p.effective_rate == pytest.approx(p.tax_payable / 650_000)
+    assert (p.marginal_rate, p.bracket_number, p.bracket_floor, p.bracket_ceiling) == (0.36, 4, 530_200, 695_800)
+    assert p.ra_deduction_limit == pytest.approx(178_750.0)  # 27.5% x 650,000
+    # deducting 178,750 takes income to 471,250: tax 89,504.50, so the refund is 61,402.50
+    assert p.ra_refund == pytest.approx(61_402.5, abs=0.5)
+    assert p.ra_refund_rate == pytest.approx(61_402.5 / 178_750, abs=1e-4)
+    assert p.tax_after_ra == pytest.approx(89_504.5, abs=0.5)
+
+
+def test_ra_refund_inside_one_bracket_is_marginal_rate_times_contribution():
+    assert ra_tax_refund(100_000, 650_000) == pytest.approx(36_000.0)  # whole deduction taxed at 36%
+    assert ra_tax_refund(0, 650_000) == 0.0
+
+
+def test_ra_refund_spanning_two_brackets_is_exact():
+    # income 400,000, deduct 100,000: 16,900 at 31% + 83,100 at 26% = 26,845 (not 100,000 x 31% = 31,000)
+    assert ra_tax_refund(100_000, 400_000) == pytest.approx(26_845.0)
+
+
+def test_ra_refund_respects_27_5_percent_limit():
+    assert ra_deduction_limit(400_000) == pytest.approx(110_000.0)
+    # a R200,000 contribution only deducts R110,000: refund = tax(400,000) - tax(290,000) = 29,445
+    assert ra_tax_refund(200_000, 400_000) == pytest.approx(29_445.0)
+    assert ra_tax_refund(200_000, 400_000) == pytest.approx(ra_tax_refund(110_000, 400_000))
+
+
+def test_ra_refund_respects_r430k_cap():
+    assert ra_deduction_limit(3_000_000) == 430_000.0
+    assert ra_tax_refund(1_000_000, 3_000_000) == pytest.approx(0.45 * 430_000)  # all in the 45% bracket
+    # 2025/26 cap was R350,000
+    assert ra_deduction_limit(3_000_000, TAX_2025_26) == 350_000.0
+    assert ra_tax_refund(1_000_000, 3_000_000, tax=TAX_2025_26) == pytest.approx(0.45 * 350_000)
+
+
+def test_ra_refund_is_zero_below_the_tax_threshold():
+    assert ra_tax_refund(20_000, 90_000) == 0.0
+    assert income_tax_profile(90_000).tax_payable == 0.0
+
+
+def test_ra_refund_accepts_arrays():
+    out = ra_tax_refund(np.array([0.0, 100_000.0, 200_000.0]), 400_000)
+    assert out == pytest.approx([0.0, 26_845.0, 29_445.0])
+
+
+def test_income_tax_table_validation():
+    with pytest.raises(ValueError):
+        IncomeTaxTable("bad", ((200_000.0, 0.18), (100_000.0, 0.26), (math.inf, 0.31)), 1.0, 1.0, 1.0)
+    with pytest.raises(ValueError):
+        IncomeTaxTable("bad", ((100_000.0, 0.18), (200_000.0, 0.26)), 1.0, 1.0, 1.0)  # no open top bracket
+
+
+def test_arbitrage_threshold():
+    # exit tax 31%: deducting is worthwhile while the bracket rate is >= 31%, i.e. down to R383,100; capped by the 27.5% limit
+    assert ra_arbitrage_threshold(650_000, 0.31) == pytest.approx(178_750.0)
+    assert ra_arbitrage_threshold(450_000, 0.31) == pytest.approx(450_000 - 383_100)
+    assert ra_arbitrage_threshold(650_000, 0.40) == 0.0  # only the 41% bracket qualifies, income never reaches it
+    assert ra_arbitrage_threshold(1_200_000, 0.40) == pytest.approx(min(1_200_000 - 887_000, 330_000))
+
+
+# --------------------------------------------------------------------------- #
+# Smart Contribution Allocator
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def split_36():
+    return optimize_wrapper_split(10_000, 650_000, None, 20, n_paths=400, seed=3)
+
+
+def test_blended_ra_tfsa_beats_discretionary_only(split_36):
+    disc, blend = split_36.strategies["discretionary"], split_36.strategies["blended"]
+    assert split_36.marginal_rate == 0.36
+    assert np.median(blend.terminal_real) > np.median(disc.terminal_real)
+    assert blend.terminal_real.mean() > disc.terminal_real.mean()
+    assert np.mean(blend.terminal_net > disc.terminal_net) > 0.99
+    gain = split_36.gain_vs("discretionary")
+    assert gain["terminal_wealth_gain_real"] > 0
+    assert gain["terminal_wealth_gain_nominal"] > gain["terminal_wealth_gain_real"]
+    assert gain["lifetime_tax_saved_real"] > 0
+
+
+def test_blended_beats_the_best_single_wrapper(split_36):
+    gain = split_36.gain_vs(split_36.best_single)
+    assert gain["terminal_wealth_gain_real"] > 0
+    assert gain["share_paths_better"] > 0.9
+
+
+def test_blended_never_worse_than_ra_only_when_refund_is_reinvested(split_36):
+    assert split_36.gain_vs("ra_only")["terminal_wealth_gain_real"] > 0
+
+
+def test_split_sums_to_budget_and_respects_statutory_limits(split_36):
+    for st in split_36.strategies.values():
+        assert sum(st.monthly_split.values()) == pytest.approx(10_000)
+        assert st.monthly_split["TFSA"] <= TAX_2026_27.tfsa_annual_limit / 12 + 1e-9
+        assert st.monthly_split["RA"] <= ra_deduction_limit(650_000) / 12 + 1e-9
+    assert split_36.strategies["discretionary"].monthly_split == {"RA": 0.0, "TFSA": 0.0, "DISC": 10_000.0}
+    assert split_36.strategies["ra_only"].monthly_split["TFSA"] == 0.0
+
+
+def test_large_budget_uses_all_three_wrappers():
+    r = optimize_wrapper_split(40_000, 1_000_000, None, 15, n_paths=300, seed=1)
+    sp = r.optimal_split
+    assert sp["RA"] == pytest.approx(275_000 / 12)  # statutory RA limit binds
+    assert sp["TFSA"] == pytest.approx(46_000 / 12)  # TFSA limit binds
+    assert sp["DISC"] == pytest.approx(40_000 - sp["RA"] - sp["TFSA"])
+    assert r.profile.marginal_rate == 0.41
+
+
+def test_naive_ra_only_is_capped_with_overflow_to_discretionary():
+    r = optimize_wrapper_split(30_000, 300_000, None, 10, n_paths=200, seed=1)  # limit = 82,500 a year = 6,875 a month
+    ra_only = r.strategies["ra_only"].monthly_split
+    assert ra_only["RA"] == pytest.approx(82_500 / 12)
+    assert ra_only["DISC"] == pytest.approx(30_000 - 82_500 / 12)
+
+
+def test_no_ra_for_income_below_tax_threshold():
+    r = optimize_wrapper_split(3_000, 90_000, None, 10, n_paths=200, seed=1)  # no tax payable, so no refund to chase
+    assert r.optimal_split["RA"] == 0.0
+    assert r.optimal_split["TFSA"] == pytest.approx(3_000)
+
+
+def test_reinvesting_the_refund_raises_blended_wealth():
+    on = optimize_wrapper_split(10_000, 650_000, None, 15, n_paths=300, seed=5, reinvest_refund=True)
+    off = optimize_wrapper_split(10_000, 650_000, None, 15, n_paths=300, seed=5, reinvest_refund=False)
+    assert np.median(on.blended.terminal_real) > np.median(off.blended.terminal_real)
+    assert on.blended.refunds.mean() > 0
+    assert on.blended.refunds_reinvested and not off.blended.refunds_reinvested
+    # spent refunds never enter terminal wealth, so the optimiser has no reason to chase them: it uses less RA
+    assert off.optimal_ra_monthly <= on.optimal_ra_monthly
+
+
+def test_refunds_match_the_exact_sars_calculation_in_year_one():
+    r = optimize_wrapper_split(5_000, 650_000, None, 5, n_paths=100, seed=2, reinvest_refund=False)
+    # year-1 RA contribution is R60,000 -> refund = 36% x 60,000 = 21,600; later years are larger in nominal terms
+    assert r.strategies["ra_only"].refunds.mean() > 5 * 21_600
+    assert r.profile.ra_refund == pytest.approx(ra_tax_refund(r.optimal_ra_monthly * 12, 650_000))
+
+
+def test_split_is_reproducible_and_marginal_rate_can_replace_income():
+    a = optimize_wrapper_split(8_000, None, 0.31, 10, n_paths=200, seed=9)
+    b = optimize_wrapper_split(8_000, None, 0.31, 10, n_paths=200, seed=9)
+    assert a.gross_income == TAX_2026_27.income_for_bracket(0.31)
+    assert np.array_equal(a.blended.terminal_net, b.blended.terminal_net)
+
+
+def test_restrict_to_arbitrage_never_exceeds_threshold():
+    r = optimize_wrapper_split(30_000, 300_000, None, 10, n_paths=200, seed=1, restrict_to_arbitrage=True)
+    assert r.optimal_ra_monthly * 12 <= r.arbitrage_annual_ra + 1e-6
+
+
+def test_split_summary_and_comparison_tables(split_36):
+    s = split_36.summary()
+    assert s["tax_year"] == "2026/27" and s["marginal_rate"] == 0.36
+    assert s["terminal_wealth_gain_real_vs_disc"] > 0
+    cmp = split_36.comparison()
+    assert list(cmp.index) == [st.name for st in split_36.strategies.values()]
+    assert cmp.loc[split_36.blended.name, "median after-tax wealth"] > cmp.iloc[0]["median after-tax wealth"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(monthly_budget=0, gross_income=500_000), dict(monthly_budget=5_000, gross_income=-1),
+     dict(monthly_budget=5_000, gross_income=None, marginal_rate=None), dict(monthly_budget=5_000, gross_income=500_000, horizon_years=2),
+     dict(monthly_budget=5_000, gross_income=500_000, n_paths=10), dict(monthly_budget=5_000, gross_income=500_000, marginal_rate=0.9)],
+)
+def test_split_input_validation(kwargs):
+    kwargs.setdefault("marginal_rate", None)
+    kwargs.setdefault("horizon_years", 10)
+    with pytest.raises(ValueError):
+        optimize_wrapper_split(**kwargs)

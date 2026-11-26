@@ -15,7 +15,7 @@ def test_parse_weights_normalises():
 
 def test_commands_registered():
     parser = build_parser()
-    for cmd in ("simulate", "optimize", "tax-compare", "charts", "stress"):
+    for cmd in ("simulate", "optimize", "tax-compare", "charts", "stress", "smart-split", "drawdown"):
         assert parser.parse_args([cmd]).command == cmd
 
 
@@ -52,10 +52,17 @@ def test_stress_command(capsys):
     assert "Sequence-of-Returns Crash" in capsys.readouterr().out
 
 
-def test_charts_command_writes_four_pngs(tmp_path, capsys):
+def test_charts_command_writes_six_pngs(tmp_path, capsys):
     assert main(["charts", "--out", str(tmp_path), "--dpi", "40", "--paths", "300", "--years", "10"]) == 0
     names = sorted(p.name for p in tmp_path.glob("*.png"))
-    assert names == ["fan_chart.png", "reg28_frontier.png", "stress_scenarios.png", "tax_wrappers.png"]
+    assert names == [
+        "fan_chart.png",
+        "living_annuity.png",
+        "reg28_frontier.png",
+        "smart_split.png",
+        "stress_scenarios.png",
+        "tax_wrappers.png",
+    ]
     assert all(p.stat().st_size > 1_000 for p in tmp_path.glob("*.png"))
 
 
@@ -65,4 +72,40 @@ def test_bad_input_returns_error_code(capsys):
 
 
 def test_version():
-    assert __version__ == "1.0.0"
+    assert __version__ == "2.0.0"
+
+
+def test_smart_split_command(capsys):
+    assert main(["smart-split", "--budget", "20000", "--income", "800000", "--years", "10", "--paths", "300"]) == 0
+    out = capsys.readouterr().out
+    assert "SARS 2026/27 Smart Contribution Split" in out
+    assert "Marginal rate 39%" in out
+    assert "Tax-optimal monthly split" in out
+    assert "Blended vs Discretionary only" in out
+
+
+def test_smart_split_no_reinvest_and_tax_year(capsys):
+    assert main(["smart-split", "--income", "500000", "--years", "8", "--paths", "200", "--no-reinvest", "--tax-year", "2025/26"]) == 0
+    out = capsys.readouterr().out
+    assert "SARS 2025/26" in out
+    assert "refunds are spent" in out
+
+
+def test_drawdown_command(capsys):
+    assert main(["drawdown", "--capital", "8000000", "--monthly-income", "40000", "--years", "25", "--paths", "300"]) == 0
+    out = capsys.readouterr().out
+    assert "Living Annuity drawdown" in out
+    assert "Portfolio survival to age 90" in out
+    assert "Median terminal bequest" in out
+    assert "Year-1 Retirement Equity Crash" in out
+
+
+def test_drawdown_command_flags_income_above_ceiling(capsys):
+    assert main(["drawdown", "--capital", "2000000", "--monthly-income", "50000", "--paths", "200", "--portfolio", "aggressive-offshore"]) == 0
+    out = capsys.readouterr().out
+    assert "exceeds the 17.5% ceiling" in out
+    assert "do not apply to a Living Annuity" in out
+
+
+def test_drawdown_bad_portfolio_returns_error_code(capsys):
+    assert main(["drawdown", "--portfolio", "no-such-portfolio", "--paths", "200"]) != 0

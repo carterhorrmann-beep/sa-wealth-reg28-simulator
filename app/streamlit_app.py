@@ -20,8 +20,19 @@ import pandas as pd
 import streamlit as st
 
 from sa_wealth.assets import ASSET_NAMES, ASSETS, default_assumptions
+from sa_wealth.drawdown import LA_MAX_RATE, LA_MIN_RATE, LA_PORTFOLIOS, DrawdownConfig, run_crash_impact
 from sa_wealth.montecarlo import SimulationConfig, run_stress, run_tax_comparison, simulate
-from sa_wealth.plots import plot_fan_chart, plot_gauge, plot_reg28_frontier, plot_stress, plot_tax_wrappers
+from sa_wealth.plots import (
+    plot_drawdown_fan,
+    plot_drawdown_income,
+    plot_fan_chart,
+    plot_gauge,
+    plot_reg28_frontier,
+    plot_smart_split,
+    plot_stress,
+    plot_survival_curve,
+    plot_tax_wrappers,
+)
 from sa_wealth.report import build_client_plan, rand
 from sa_wealth.reg28_tax import (
     MARGINAL_RATES,
@@ -30,8 +41,11 @@ from sa_wealth.reg28_tax import (
     WRAPPER_NAMES,
     check_reg28,
     efficient_frontier,
+    income_tax_profile,
     offshore_sensitivity,
+    optimize_wrapper_split,
     portfolio_presets,
+    ra_deduction_limit,
     reg28_tradeoff,
 )
 
@@ -93,6 +107,60 @@ def cached_optimiser(infl: float):
     }
 
 
+@st.cache_data(show_spinner="Optimising your contribution split...")
+def cached_split(
+    budget: float,
+    gross_income: float,
+    marginal: float,
+    years: int,
+    age: int,
+    weights: tuple[float, ...],
+    infl: float,
+    tax_year: str,
+    paths: int,
+    seed: int,
+    reinvest: bool,
+):
+    a = default_assumptions().with_inflation(infl)
+    return optimize_wrapper_split(
+        budget,
+        gross_income if gross_income > 0 else None,
+        marginal,
+        years,
+        age=age,
+        weights=np.array(weights),
+        assumptions=a,
+        tax=TAX_PRESETS[tax_year],
+        n_paths=paths,
+        seed=seed,
+        reinvest_refund=reinvest,
+    )
+
+
+@st.cache_data(show_spinner="Simulating Living Annuity drawdown...")
+def cached_drawdown(
+    capital: float,
+    monthly_income: float,
+    horizon: int,
+    retirement_age: int,
+    portfolio: str,
+    fee: float,
+    infl: float,
+    paths: int,
+    seed: int,
+):
+    cfg = DrawdownConfig(
+        initial_capital=capital,
+        monthly_income_real=monthly_income,
+        horizon_years=horizon,
+        retirement_age=retirement_age,
+        n_paths=paths,
+        seed=seed,
+        annual_fee=fee,
+    )
+    return run_crash_impact(cfg, default_assumptions().with_inflation(infl), portfolio)
+
+
 def badge(ok: bool, text: str) -> None:
     color = "#1b5e20" if ok else "#b71c1c"
     mark = "&#10004;" if ok else "&#10008;"
@@ -122,20 +190,39 @@ sb.caption(f"Investment horizon: **{years} years**")
 initial = sb.slider("Initial capital (ZAR)", 0, 5_000_000, 250_000, step=10_000, format="R%d")
 monthly = sb.slider("Monthly contribution (ZAR, today's money)", 0, 50_000, 5_000, step=500, format="R%d")
 target = sb.slider("Target real retirement capital (today's ZAR)", 500_000, 30_000_000, 5_000_000, step=250_000, format="R%d")
-marginal = sb.select_slider("Marginal tax bracket", options=list(MARGINAL_RATES), value=0.36, format_func=lambda x: f"{x:.0%}")
+tax_year = sb.selectbox(
+    "SARS tax year",
+    list(TAX_PRESETS),
+    index=list(TAX_PRESETS).index("2026/27"),
+    help="2025/26: TFSA R36k, RA cap R350k. 2026/27 (Budget 2026): TFSA R46k, RA cap R430k, CGT exclusion R50k, "
+    "brackets and rebates up 3.4%.",
+)
+tax_params = TAX_PRESETS[tax_year]
+gross_income = float(
+    sb.number_input(
+        "Gross annual income (ZAR, optional)",
+        0,
+        20_000_000,
+        0,
+        step=10_000,
+        help="Taxable income before any RA deduction. Enter it to calculate your SARS marginal rate and exact RA refund "
+        "automatically; leave at 0 to pick a bracket yourself.",
+    )
+)
+if gross_income > 0:
+    sars = income_tax_profile(gross_income, age=age, tax=tax_params)
+    marginal = sars.marginal_rate
+    sb.markdown(f"**SARS {sars.tax_year} marginal rate: {marginal:.0%}**")
+    sb.caption(f"Effective rate {sars.effective_rate:.1%}  |  tax payable {rand(sars.tax_payable)} a year")
+    sb.caption(f"Max RA deduction {rand(sars.ra_deduction_limit)}  |  refund {rand(sars.ra_refund)}")
+else:
+    marginal = sb.select_slider("Marginal tax bracket", options=list(MARGINAL_RATES), value=0.36, format_func=lambda x: f"{x:.0%}")
 
 sb.header("Portfolio")
 with sb.expander("Market & model settings", expanded=False):
     infl = st.slider("Mean SA CPI inflation (%)", 3.0, 10.0, 5.5, step=0.1) / 100.0
     paths = st.select_slider("Monte Carlo paths", options=[2_000, 5_000, 10_000], value=5_000)
     seed = int(st.number_input("Random seed", 0, 10_000, 42))
-    tax_year = st.selectbox(
-        "Statutory tax parameters",
-        list(TAX_PRESETS),
-        index=0,
-        help="2025/26 uses TFSA R36k, RA cap R350k, CGT exclusion R40k. 2026/27 reflects Budget 2026 (R46k / R430k / R50k).",
-    )
-    income_in = st.number_input("Annual taxable income (ZAR, 0 = typical for bracket)", 0, 10_000_000, 0, step=10_000)
     wrapper = st.selectbox("Wrapper for projection & stress tabs", ["RA", "TFSA", "DISC"], format_func=lambda k: WRAPPER_NAMES[k])
 
 presets = cached_presets(infl)
@@ -162,7 +249,7 @@ params = dict(
     paths=int(paths),
     seed=seed,
     marginal=float(marginal),
-    income=float(income_in),
+    income=float(gross_income),
     wrapper=wrapper,
     tax_year=tax_year,
     infl=float(infl),
@@ -170,8 +257,14 @@ params = dict(
 w_arr = np.array(weights)
 report = check_reg28(w_arr)
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["1 | Wealth projection", "2 | Reg 28 optimiser & offshore cap", "3 | Tax wrappers", "4 | Stress tests & client plan"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "1 | Wealth projection",
+        "2 | Reg 28 optimiser & offshore cap",
+        "3 | Tax wrappers",
+        "4 | Stress tests & client plan",
+        "5 | Living Annuity drawdown",
+    ]
 )
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +409,71 @@ with tab3:
             + ", ".join(f"{a} {x:.0%}" for a, x in zip(ASSETS, tc.weights_ra) if x > 1e-6)
         )
 
+    st.divider()
+    st.subheader("Smart Contribution Split")
+    st.caption(
+        "How to divide a monthly budget between a Retirement Annuity, a TFSA and a taxable Discretionary account to "
+        f"maximise after-tax wealth, using the SARS {tax_year} tax table."
+    )
+    if gross_income > 0:
+        sp_income = gross_income
+        sp_profile = income_tax_profile(gross_income, age=age, tax=tax_params)
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("SARS marginal rate", f"{sp_profile.marginal_rate:.0%}")
+        p2.metric("Effective tax rate", f"{sp_profile.effective_rate:.1%}")
+        p3.metric("Tax payable (a year)", rand(sp_profile.tax_payable))
+        p4.metric("Max RA refund (a year)", rand(sp_profile.ra_refund), help=f"Deduction limit {rand(sp_profile.ra_deduction_limit)}")
+    else:
+        sp_income = tax_params.income_for_bracket(marginal)
+        st.info(
+            f"No gross income entered, so a typical income for the {marginal:.0%} bracket ({rand(sp_income)}) is used. "
+            "Enter your gross annual income in the sidebar for an exact SARS refund calculation."
+        )
+    b1, b2 = st.columns([2, 1])
+    budget = float(
+        b1.number_input("Monthly budget to allocate (ZAR, today's money)", 500, 500_000, max(int(monthly), 500), step=500)
+    )
+    reinvest = b2.checkbox("Reinvest the RA refund", value=True, help="Put each year's SARS refund into the TFSA / taxable sleeve.")
+    split = cached_split(budget, gross_income, float(marginal), int(years), int(age), weights, float(infl), tax_year, int(paths), int(seed), bool(reinvest))
+    opt_split = split.optimal_split
+    sm_cols = st.columns(3)
+    for col, (key, label) in zip(sm_cols, (("RA", "Retirement Annuity"), ("TFSA", "Tax-Free Savings"), ("DISC", "Discretionary"))):
+        col.metric(f"{label} / month", rand(opt_split[key]), delta=f"{opt_split[key] / budget:.0%} of budget", delta_color="off")
+    gain = split.gain_vs(split.best_single)
+    key_g = "terminal_wealth_gain_real" if real else "terminal_wealth_gain_nominal"
+    key_t = "lifetime_tax_saved_real" if real else "lifetime_tax_saved_nominal"
+    g1, g2 = st.columns(2)
+    g1.metric(
+        "After-tax terminal wealth gain vs best single wrapper",
+        rand(gain[key_g]),
+        help="Mean paired difference across all simulated paths between the blended and the better of Discretionary-only / RA-only.",
+    )
+    g2.metric(
+        "Lifetime tax saved vs best single wrapper",
+        rand(gain[key_t]),
+        help="Income tax + CGT + RA exit tax, minus SARS refunds. Shown in today's rand when the real view is selected.",
+    )
+    st.pyplot(plot_smart_split(split, real=real))
+    cmp = split.comparison(real=real)
+    cmp_view = pd.DataFrame(
+        {
+            "RA / month": cmp["RA / month"].map(rand),
+            "TFSA / month": cmp["TFSA / month"].map(rand),
+            "Discretionary / month": cmp["Discretionary / month"].map(rand),
+            "Median after-tax wealth": cmp["median after-tax wealth"].map(rand),
+            "Lifetime tax paid": cmp["lifetime tax paid"].map(rand),
+            "SARS refunds": cmp["SARS refunds"].map(rand),
+            "Net lifetime tax": cmp["net lifetime tax"].map(rand),
+        }
+    )
+    st.dataframe(cmp_view)
+    st.caption(
+        f"Refund-arbitrage threshold: {rand(split.arbitrage_annual_ra)} a year. Up to there each rand deducted is refunded at a "
+        f"higher rate than the {split.arbitrage_exit_rate:.0%} expected RA exit tax. The statutory RA deduction limit is "
+        f"{rand(ra_deduction_limit(sp_income, tax_params))} a year; "
+        f"TFSA limit R{tax_params.tfsa_annual_limit:,.0f} a year. Budget and income grow with CPI; rand limits stay fixed."
+    )
+
 # --------------------------------------------------------------------------- #
 # Tab 4 - Stress tests & export
 # --------------------------------------------------------------------------- #
@@ -356,3 +514,96 @@ with tab4:
     )
     with st.expander("Preview"):
         st.markdown(plan_md)
+
+# --------------------------------------------------------------------------- #
+# Tab 5 - Living Annuity drawdown
+# --------------------------------------------------------------------------- #
+with tab5:
+    st.subheader("Living Annuity drawdown & ruin engine")
+    st.caption(
+        f"Post-retirement income of {LA_MIN_RATE:.1%} to {LA_MAX_RATE:.1%} of capital a year, reset on each policy anniversary. "
+        "Living Annuities are exempt from Regulation 28 offshore caps."
+    )
+    la1, la2, la3 = st.columns(3)
+    la_capital = la1.slider("Initial retirement capital (ZAR)", 1_000_000, 20_000_000, 8_000_000, step=100_000, format="R%d")
+    la_income = la2.slider("Desired real monthly income (ZAR, today's money)", 5_000, 150_000, 40_000, step=1_000, format="R%d")
+    la_years = la3.slider("Retirement horizon (years)", 25, 35, 30)
+    la4, la5 = st.columns([2, 1])
+    la_portfolio = la4.selectbox("Portfolio allocation", list(LA_PORTFOLIOS), index=1)
+    la_fee = la5.slider("All-in annual fee (%)", 0.0, 3.0, 0.0, step=0.1) / 100.0
+    la_rate = 12.0 * la_income / la_capital
+    st.caption(
+        f"Initial withdrawal rate: **{la_rate:.2%}** of capital. Income escalates every year with simulated SA CPI "
+        f"({int(paths):,} Cholesky-correlated paths, retiring at {ret_age}, planning to age {ret_age + la_years})."
+    )
+    if la_rate > LA_MAX_RATE:
+        st.error(
+            f"Your desired income is {la_rate:.1%} of capital, above the {LA_MAX_RATE:.1%} statutory ceiling. "
+            f"The most a Living Annuity can pay in year 1 is {rand(LA_MAX_RATE * la_capital / 12)} a month."
+        )
+    elif la_rate < LA_MIN_RATE:
+        st.info(
+            f"{la_rate:.1%} is below the {LA_MIN_RATE:.1%} statutory minimum, so you must draw at least "
+            f"{rand(LA_MIN_RATE * la_capital / 12)} a month."
+        )
+    impact = cached_drawdown(
+        float(la_capital), float(la_income), int(la_years), int(ret_age), la_portfolio, float(la_fee), float(infl), int(paths), int(seed)
+    )
+    la = impact.base
+    ls = la.summary()
+    if not la.reg28_compliant:
+        st.info("This allocation exceeds Regulation 28 limits, which is allowed inside a Living Annuity.")
+    breach_year = ls["median_years_to_cap_breach"]
+    if la.cap_breach_prob >= 0.5:
+        st.warning(
+            f"Statutory ceiling warning: in {la.cap_breach_prob:.0%} of simulated paths your inflation-adjusted income needs more "
+            f"than {LA_MAX_RATE:.1%} of capital (median: year {breach_year:.0f}, age {ret_age + breach_year:.0f}). "
+            "From then on the income is capped at 17.5% of capital and shrinks in real terms."
+        )
+    elif la.cap_breach_prob > 0:
+        st.info(
+            f"The {LA_MAX_RATE:.1%} ceiling is breached in {la.cap_breach_prob:.0%} of paths "
+            f"(median year {breach_year:.0f} among those)."
+        )
+    else:
+        st.success(f"The {LA_MAX_RATE:.1%} statutory ceiling is never reached in the simulated paths.")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        f"Survival to age {la.config.end_age}",
+        f"{ls['survival_prob']:.1%}",
+        help="Share of paths where capital never falls below one year of the desired income. A Living Annuity can never "
+        "reach exactly zero because income is a percentage of capital, so this is the practical definition of a depleted fund.",
+    )
+    k2.metric("Median terminal bequest (today's rand)", rand(ls["median_bequest_real"]), help=f"P10: {rand(ls['p10_bequest_real'])}")
+    k3.metric(
+        "Years to ceiling breach",
+        "Never" if breach_year != breach_year else f"{breach_year:.0f} years",
+        help="Median among the paths that breach the ceiling.",
+    )
+    k4.metric(
+        "After year-1 -25% equity crash",
+        f"{impact.crash.survival_prob():.1%}",
+        delta=f"{(impact.crash.survival_prob() - ls['survival_prob']) * 100:+.1f} pp survival",
+        delta_color="inverse" if impact.crash.survival_prob() >= ls["survival_prob"] else "normal",
+    )
+    milestones = la.survival_milestones()
+    st.caption("Survival: " + "  |  ".join(f"age {a}: {p:.1%}" for a, p in milestones.items()))
+    show_crash = st.checkbox("Overlay the year-1 crash scenario", value=True)
+    st.pyplot(plot_drawdown_fan(la, impact.crash if show_crash else None, real=real))
+    st.pyplot(plot_drawdown_income(la, real=real))
+    st.pyplot(plot_survival_curve(la, impact.crash if show_crash else None))
+    st.subheader("Sequence-of-returns test")
+    st.write(impact.scenario.description)
+    st.dataframe(impact.formatted_table(rand))
+    st.subheader("Capital by year")
+    cap_tbl = la.percentiles(real=real)
+    cap_rows = sorted(set(range(0, len(cap_tbl), 5)) | {len(cap_tbl) - 1})
+    cap_view = cap_tbl.iloc[cap_rows].map(rand)
+    cap_view.index = [f"age {la.config.retirement_age + int(y)}" for y in cap_view.index]
+    st.dataframe(cap_view)
+    taxed = income_tax_profile(12.0 * la_income, age=ret_age, tax=tax_params)
+    st.caption(
+        f"For reference, SARS {tax_year} income tax on {rand(12.0 * la_income)} a year at age {ret_age} is about "
+        f"{rand(taxed.tax_payable)} (age-based rebates, no other income), leaving roughly {rand((12.0 * la_income - taxed.tax_payable) / 12.0)} a month. "
+        "Simulated incomes are before tax."
+    )

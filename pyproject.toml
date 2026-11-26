@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sa-wealth"
-version = "1.0.0"
-description = "South African Regulation 28 private wealth & tax-aware Monte Carlo allocator"
+version = "2.0.0"
+description = "South African Regulation 28 private wealth, SARS tax-aware allocator and Living Annuity drawdown simulator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Carter Horrmann" }]
-keywords = ["south africa", "regulation 28", "monte carlo", "retirement annuity", "tfsa", "portfolio optimisation"]
+keywords = ["south africa", "regulation 28", "monte carlo", "retirement annuity", "tfsa", "living annuity", "sars", "portfolio optimisation"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",

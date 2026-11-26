@@ -1,7 +1,7 @@
 """High-DPI charts (matplotlib, object-oriented API so they work headless and inside Streamlit).
 
 Every ``plot_*`` function returns a :class:`matplotlib.figure.Figure`. :func:`generate_all_charts`
-writes the four documentation charts used in the README.
+writes the six documentation charts used in the README.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from matplotlib.patches import Wedge
 from matplotlib.ticker import FuncFormatter
 
 from .assets import ASSETS, MarketAssumptions, default_assumptions
+from .drawdown import CrashImpact, DrawdownConfig, DrawdownResult, run_crash_impact
 from .montecarlo import (
     SimulationConfig,
     SimulationResult,
@@ -32,11 +33,17 @@ from .reg28_tax import (
     RA,
     REG28,
     STATIC_PRESETS,
+    STRATEGY_BLENDED,
+    STRATEGY_DISC,
+    STRATEGY_RA,
+    TAX_2026_27,
     TFSA,
     WRAPPER_NAMES,
+    SmartSplitResult,
     efficient_frontier,
     offshore_sensitivity,
     optimize_portfolio,
+    optimize_wrapper_split,
 )
 
 DPI = 300
@@ -53,6 +60,9 @@ COLORS = {
     "reg28": "#00796b",
     "text": "#263238",
     "grid": "#cfd8dc",
+    "crash": "#d84315",
+    "income": "#3949ab",
+    "cap": "#8e24aa",
 }
 
 _RC = {
@@ -320,6 +330,227 @@ def plot_stress(stress: StressResult, target_real: float | None = None) -> Figur
 
 
 # --------------------------------------------------------------------------- #
+# Living Annuity drawdown
+# --------------------------------------------------------------------------- #
+
+
+def _draw_fan(ax, result: DrawdownResult, crash: DrawdownResult | None = None, real: bool = True) -> None:
+    pct = result.percentiles(real=real)
+    ages = result.ages
+    ax.fill_between(ages, pct["P10"], pct["P90"], color=COLORS["band_outer"], label="P10 - P90", lw=0)
+    ax.fill_between(ages, pct["P25"], pct["P75"], color=COLORS["band_inner"], alpha=0.85, label="P25 - P75", lw=0)
+    ax.plot(ages, pct["P50"], color=COLORS["median"], lw=2.4, label="Median (P50)")
+    if crash is not None:
+        cp = crash.percentiles(real=real)
+        ax.plot(ages, cp["P50"], color=COLORS["crash"], lw=2.0, ls="--", label="Median after year-1 crash")
+    ax.yaxis.set_major_formatter(ZAR_FMT)
+    ax.set_xlabel("Age")
+    ax.set_ylabel("Capital (today's rand)" if real else "Capital (nominal ZAR)")
+    ax.set_xlim(ages[0], ages[-1])
+    ax.set_ylim(bottom=0)
+    ax.annotate(
+        f"Median bequest {zar(pct['P50'].iloc[-1])}",
+        xy=(ages[-1], pct["P50"].iloc[-1]),
+        xytext=(-6, 16),
+        textcoords="offset points",
+        ha="right",
+        color=COLORS["median"],
+        fontweight="bold",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.85),
+    )
+    ax.legend(loc="upper right", fontsize=8.5)
+    ax.grid(True)
+
+
+def _draw_income(ax, result: DrawdownResult, real: bool = True) -> None:
+    inc = result.income_percentiles(real=real) / 12.0
+    ages = result.ages[:-1]
+    ax.fill_between(ages, inc["P10"], inc["P90"], color=COLORS["band_outer"], label="P10 - P90", lw=0)
+    ax.plot(ages, inc["P50"], color=COLORS["income"], lw=2.4, label="Median income")
+    if real:
+        ax.axhline(
+            result.config.monthly_income_real, color=COLORS["goal"], ls="--", lw=1.6,
+            label=f"Desired {zar(result.config.monthly_income_real)} / month",
+        )
+    ax.yaxis.set_major_formatter(ZAR_FMT)
+    ax.set_xlabel("Age")
+    ax.set_ylabel("Monthly income (today's rand)" if real else "Monthly income (nominal ZAR)")
+    ax.set_xlim(ages[0], ages[-1])
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="lower left", fontsize=8.5)
+    ax.grid(True)
+
+
+def _draw_survival(ax, result: DrawdownResult, crash: DrawdownResult | None = None) -> None:
+    ax.plot(result.ages, result.survival_curve() * 100, color=COLORS["median"], lw=2.4, label="Survival probability")
+    ax.plot(result.ages, result.cap_breach_curve() * 100, color=COLORS["cap"], lw=2.0, ls="-.", label="17.5% ceiling breached")
+    if crash is not None:
+        ax.plot(result.ages, crash.survival_curve() * 100, color=COLORS["crash"], lw=2.0, ls="--", label="Survival after year-1 crash")
+    milestones = result.survival_milestones()
+    for age in milestones:
+        ax.axvline(age, color="#90a4ae", ls=":", lw=1.0)
+    if milestones:
+        ax.text(
+            0.03, 0.55, "Survival probability\n" + "\n".join(f"to age {a}: {p:.0%}" for a, p in milestones.items()),
+            transform=ax.transAxes, fontsize=9.5, fontweight="bold", color=COLORS["median"], va="top",
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=COLORS["grid"]),
+        )
+    ax.set_xlabel("Age")
+    ax.set_ylabel("Probability (%)")
+    ax.set_xlim(result.ages[0], result.ages[-1])
+    ax.set_ylim(0, 102)
+    ax.legend(loc="lower left", fontsize=8.5)
+    ax.grid(True)
+
+
+def plot_drawdown_fan(result: DrawdownResult, crash: DrawdownResult | None = None, real: bool = True) -> Figure:
+    """Living Annuity capital fan (P10-P90, P25-P75, median) by age, optionally with the crash-scenario median."""
+    cfg = result.config
+    with mpl.rc_context(_RC):
+        fig = Figure(figsize=(9.5, 5.2))
+        ax = fig.subplots()
+        _draw_fan(ax, result, crash, real)
+        ax.set_title(
+            f"Living Annuity capital - {zar(cfg.initial_capital)} start, {zar(cfg.monthly_income_real)}/month "
+            f"(today's rand)\n{result.capital.shape[0]:,} paths | survival to {cfg.end_age} = {result.survival_prob():.0%} | "
+            f"{result.portfolio}",
+            loc="left",
+        )
+        fig.tight_layout()
+    return fig
+
+
+def plot_drawdown_income(result: DrawdownResult, real: bool = True) -> Figure:
+    """Monthly income paid (P10 / median / P90) against the income the retiree wants."""
+    with mpl.rc_context(_RC):
+        fig = Figure(figsize=(9.5, 4.6))
+        ax = fig.subplots()
+        _draw_income(ax, result, real)
+        ax.set_title("Income actually paid vs desired income", loc="left")
+        fig.tight_layout()
+    return fig
+
+
+def plot_survival_curve(result: DrawdownResult, crash: DrawdownResult | None = None) -> Figure:
+    """Probability the fund survives, and the cumulative probability that the 17.5% ceiling has been breached."""
+    with mpl.rc_context(_RC):
+        fig = Figure(figsize=(9.5, 4.6))
+        ax = fig.subplots()
+        _draw_survival(ax, result, crash)
+        ax.set_title("Portfolio survival and statutory-ceiling breach by age", loc="left")
+        fig.tight_layout()
+    return fig
+
+
+def plot_living_annuity(result: DrawdownResult, impact: CrashImpact | None = None, real: bool = True) -> Figure:
+    """Three-panel Living Annuity summary: capital fan, income paid vs desired, survival and ceiling breach."""
+    cfg = result.config
+    crash = None if impact is None else impact.crash
+    with mpl.rc_context(_RC):
+        fig = Figure(figsize=(18, 5.6))
+        ax, bx, cx = fig.subplots(1, 3, gridspec_kw={"width_ratios": [1.25, 1, 1]})
+        _draw_fan(ax, result, crash, real)
+        ax.set_title("Capital fan", loc="left")
+        _draw_income(bx, result, real)
+        bx.set_title("Income paid vs desired", loc="left")
+        _draw_survival(cx, result, crash)
+        cx.set_title("Survival & 17.5% ceiling", loc="left")
+        breach = result.median_years_to_cap_breach
+        breach_txt = "never" if np.isnan(breach) else f"median year {breach:.0f}"
+        fig.suptitle(
+            f"Living Annuity drawdown: {zar(cfg.initial_capital)} at age {cfg.retirement_age}, "
+            f"{zar(cfg.monthly_income_real)}/month escalating with CPI ({cfg.initial_withdrawal_rate:.1%} initial rate), "
+            f"{result.portfolio}\n"
+            f"survival to {cfg.end_age}: {result.survival_prob():.0%} | ceiling breached in {result.cap_breach_prob:.0%} of paths ({breach_txt}) | "
+            f"median real bequest {zar(result.median_bequest_real)}"
+            + ("" if impact is None else f" | year-1 -25% equity crash: survival {impact.crash.survival_prob():.0%}"),
+            x=0.01,
+            y=0.995,
+            ha="left",
+            fontsize=11.5,
+            fontweight="bold",
+        )
+        fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# SARS smart contribution split
+# --------------------------------------------------------------------------- #
+
+_SPLIT_LABELS = {STRATEGY_DISC: "Discretionary\nonly", STRATEGY_RA: "RA only\n(capped)", STRATEGY_BLENDED: "Tax-optimal\nblend"}
+_SPLIT_COLORS = {"RA": COLORS[RA], "TFSA": COLORS[TFSA], "DISC": COLORS[DISC]}
+
+
+def plot_smart_split(split: SmartSplitResult, real: bool = True) -> Figure:
+    """Year-1 monthly split, after-tax terminal wealth and lifetime tax for the three contribution strategies."""
+    keys = [STRATEGY_DISC, STRATEGY_RA, STRATEGY_BLENDED]
+    labels = [_SPLIT_LABELS[k] for k in keys]
+    sfx = "(today's rand)" if real else "(nominal ZAR)"
+    with mpl.rc_context(_RC):
+        fig = Figure(figsize=(17, 5.6))
+        ax, bx, cx = fig.subplots(1, 3, gridspec_kw={"width_ratios": [1.1, 1, 1.15]})
+
+        bottom = np.zeros(len(keys))
+        for part, name in (("RA", "RA"), ("TFSA", "TFSA"), ("DISC", "Discretionary")):
+            vals = np.array([split.strategies[k].monthly_split[part] for k in keys])
+            ax.bar(labels, vals, bottom=bottom, color=_SPLIT_COLORS[part], label=name, width=0.6)
+            for i, v in enumerate(vals):
+                if v >= 0.045 * split.monthly_budget:
+                    ax.text(i, bottom[i] + v / 2, f"R{v:,.0f}", ha="center", va="center", fontsize=8.5, color="white", fontweight="bold")
+            bottom += vals
+        ax.set_ylabel("Year-1 monthly contribution (ZAR)")
+        ax.yaxis.set_major_formatter(ZAR_FMT)
+        ax.set_title(f"Monthly split of R{split.monthly_budget:,.0f}", loc="left")
+        ax.legend(loc="upper left", fontsize=8.5, ncol=3, bbox_to_anchor=(0, -0.16))
+        _style(ax)
+
+        med = [float(np.median(split.strategies[k].terminal_real if real else split.strategies[k].terminal_net)) for k in keys]
+        bars = bx.bar(labels, med, color=["#c62828", "#00796b", "#1565c0"], width=0.6)
+        for b, v in zip(bars, med):
+            bx.annotate(zar(v), (b.get_x() + b.get_width() / 2, v), xytext=(0, 4), textcoords="offset points", ha="center", fontweight="bold")
+        gain = split.gain_vs(split.best_single)["terminal_wealth_gain_real" if real else "terminal_wealth_gain_nominal"]
+        bx.set_title(f"Median after-tax wealth, {split.horizon_years} years", loc="left")
+        bx.set_ylabel(f"After-tax terminal wealth {sfx}")
+        bx.yaxis.set_major_formatter(ZAR_FMT)
+        bx.set_ylim(0, max(med) * 1.3)
+        bx.text(0.02, 0.98, f"Blend vs best single wrapper:\n{'+' if gain >= 0 else '-'}{zar(abs(gain))} on average", transform=bx.transAxes, va="top", fontsize=9.5, fontweight="bold", color="#1565c0")
+        _style(bx)
+
+        x = np.arange(len(keys))
+        paid = [float((split.strategies[k].tax_paid_real if real else split.strategies[k].tax_paid).mean()) for k in keys]
+        ref = [float((split.strategies[k].refunds_real if real else split.strategies[k].refunds).mean()) for k in keys]
+        cx.bar(x - 0.19, paid, width=0.36, color="#e57373", label="Tax paid (income, CGT, RA exit)")
+        cx.bar(x + 0.19, ref, width=0.36, color="#66bb6a", label="SARS RA refunds")
+        for i, (a, b) in enumerate(zip(paid, ref)):
+            cx.annotate(f"net {zar(a - b)}", (i, max(a, b)), xytext=(0, 5), textcoords="offset points", ha="center", fontsize=9, fontweight="bold")
+        cx.set_xticks(x)
+        cx.set_xticklabels(labels)
+        cx.set_ylim(0, max(paid + ref) * 1.15)
+        cx.set_ylabel(f"Lifetime tax {sfx}")
+        cx.yaxis.set_major_formatter(ZAR_FMT)
+        saved = split.gain_vs(split.best_single)["lifetime_tax_saved_real" if real else "lifetime_tax_saved_nominal"]
+        cx.set_title(f"Lifetime tax (blend saves {zar(saved)} vs best single)", loc="left")
+        cx.legend(loc="upper left", fontsize=8.5, bbox_to_anchor=(0, -0.16))
+        _style(cx)
+
+        p = split.profile
+        fig.suptitle(
+            f"SARS {p.tax_year} Smart Contribution Split: income R{split.gross_income:,.0f} | marginal {split.marginal_rate:.0%} | "
+            f"effective {p.effective_rate:.1%} | {split.horizon_years} years | {split.n_paths:,} paths"
+            + (" | refunds reinvested" if split.reinvest_refund else " | refunds spent"),
+            x=0.01,
+            y=0.995,
+            ha="left",
+            fontsize=11.5,
+            fontweight="bold",
+        )
+        fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------- #
 # Documentation charts
 # --------------------------------------------------------------------------- #
 
@@ -330,8 +561,17 @@ def generate_all_charts(
     config: SimulationConfig | None = None,
     weights: Mapping[str, float] | np.ndarray | None = None,
     assumptions: MarketAssumptions | None = None,
+    drawdown_config: DrawdownConfig | None = None,
+    split_budget: float = 40_000.0,
+    split_income: float = 1_000_000.0,
+    split_years: int = 25,
 ) -> list[Path]:
-    """Write ``fan_chart.png``, ``reg28_frontier.png``, ``tax_wrappers.png`` and ``stress_scenarios.png``."""
+    """Write the six documentation charts.
+
+    ``fan_chart.png``, ``reg28_frontier.png``, ``tax_wrappers.png``, ``stress_scenarios.png`` plus
+    ``living_annuity.png`` (R8m Living Annuity, R40k/month, 30 years by default) and ``smart_split.png``
+    (R40k/month budget on a R1m taxable income, SARS 2026/27 tables).
+    """
     assumptions = assumptions or default_assumptions()
     config = config or SimulationConfig(horizon_years=30, n_paths=5_000)
     weights = STATIC_PRESETS["Moderate (Reg 28)"] if weights is None else weights
@@ -347,4 +587,20 @@ def generate_all_charts(
     paths.append(save_figure(plot_tax_wrappers(tc, real=True), out / "tax_wrappers.png", dpi))
     st = run_stress(config, weights, assumptions)
     paths.append(save_figure(plot_stress(st, config.target_real), out / "stress_scenarios.png", dpi))
+
+    dcfg = drawdown_config or DrawdownConfig(n_paths=config.n_paths, seed=config.seed)
+    impact = run_crash_impact(dcfg, assumptions, "Moderate (Reg 28)")
+    paths.append(save_figure(plot_living_annuity(impact.base, impact), out / "living_annuity.png", dpi))
+    split = optimize_wrapper_split(
+        split_budget,
+        split_income,
+        None,
+        split_years,
+        weights=weights,
+        assumptions=assumptions,
+        tax=TAX_2026_27,
+        n_paths=config.n_paths,
+        seed=config.seed,
+    )
+    paths.append(save_figure(plot_smart_split(split), out / "smart_split.png", dpi))
     return paths
