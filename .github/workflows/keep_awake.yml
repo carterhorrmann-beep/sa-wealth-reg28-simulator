@@ -1,0 +1,18 @@
+name: Keep Streamlit Apps Awake
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping both Streamlit dashboards
+        run: |
+          DOMAIN="streamlit.app"
+          APP1="https://jse-risk-backtester-5zjcxegbgjxtkappkuj39xk.${DOMAIN}/"
+          APP2="https://sa-wealth-reg28-simulator-t9gykeq27yzyjmejcrfgwj.${DOMAIN}/"
+          curl -s -o /dev/null -w "App 1 HTTP %{http_code}\n" "$APP1"
+          curl -s -o /dev/null -w "App 2 HTTP %{http_code}\n" "$APP2"
